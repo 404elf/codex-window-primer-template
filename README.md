@@ -68,12 +68,29 @@ Codex OAuth may refresh or rotate credentials while a run is active. The workflo
 
 The workflow uses a single concurrency group so two runs cannot refresh the same OAuth state at once. It has only `schedule` and `workflow_dispatch` triggers. There are no Pull Request, Issue, push, reusable-workflow, or external-input credential paths.
 
+The credential-bearing stages are deliberately separated. Only the decrypt
+stage receives `AGE_PRIVATE_KEY`; it derives and saves the public age
+recipient, then removes the private key before Codex starts. Codex receives a
+fresh `CODEX_HOME` and an empty process environment containing only the small
+allowlist needed to run. Re-encryption uses the saved public recipient only.
+The checkout uses `persist-credentials: false`, so no GitHub token is left in
+git configuration or in the Codex process.
+
+Only the final persistence stage receives a temporary `github.token`. It
+fetches the newest branch, compares the remote `auth.json.enc` blob with the
+blob that was decrypted, and safely rebases the ciphertext-only commit over
+ordinary schedule/configuration commits. If the encrypted state changed or a
+safe push is impossible, the run fails closed and attempts to preserve the
+new encrypted state on a private, run-specific `codex-auth-recovery-*` branch.
+It never force-pushes or claims success after a failed persistence operation.
+
 ## Security and supply chain
 
 - The official `@openai/codex` CLI is fixed to version `0.150.1` in the workflow.
 - The CLI runs one fixed `Reply with exactly: OK` prompt with `gpt-5.6-luna` and low reasoning; output and diagnostics are suppressed.
 - The checkout action is pinned to a commit SHA. No remote shell script is executed.
 - The runtime workflow uses an isolated `CODEX_HOME`, no `OPENAI_API_KEY`, and only the `contents: write` permission needed to persist encrypted state.
+- `AGE_PRIVATE_KEY` exists only in the decrypt step; the Codex step uses an explicit `shell_environment_policy` allowlist and `env -i`.
 - `codex-action` and `codex-docker` are audited references only, not runtime dependencies. No remote shell installer is used.
 - GitHub Actions may start late. A late run does not create an additional quota; it only shifts the actual prime time.
 
@@ -93,8 +110,16 @@ To uninstall, first pause the plan, wait for any active run to finish, remove th
 
 **Why not poll every 30 minutes?** Codex creates only the requested one-time or recurring schedule. There is no background polling loop.
 
+**Why does a one-time plan have a day/month cron?** GitHub Actions has no native one-shot schedule. The calendar gate checks the exact dated plan and prevents later yearly wake-ups from sending a request; Codex can disable the plan after the intended run.
+
 **Why is there a public template and a private repository?** Source can be audited and shared without exposing the per-user OAuth state or refresh-token history.
+
+**What does `RRULE:FREQ=DAILY;COUNT=1` mean?** It means one total occurrence. The `COUNT=1` clause does not mean “run daily”. The cloud workflow uses the structured plan and a marked cron line instead of the paused local automation.
+
+**What happens if another update reaches the private repository first?** The workflow keeps the ordinary remote configuration on the main branch, fails closed, and attempts to save the newly refreshed encrypted state on a private recovery branch. Do not delete that branch until the encrypted state has been safely reconciled.
 
 ## Reference audit
 
 The design was reviewed against [`VIEWVIEWVIEW/codex-session-primer`](https://github.com/VIEWVIEWVIEW/codex-session-primer), [`icoretech/codex-action`](https://github.com/icoretech/codex-action), and [`icoretech/codex-docker`](https://github.com/icoretech/codex-docker). It retains encrypted file-backed OAuth, refresh persistence, concurrency, runner isolation, quiet mode, and fixed versions. `codex-action` and `codex-docker` are references only, not dependencies. It intentionally omits periodic polling, multiple model requests, commit-age heuristics, and force-push updates.
+
+See [LICENSE](LICENSE) for the project license and [SECURITY.md](SECURITY.md) for credential-handling and private vulnerability-reporting guidance.

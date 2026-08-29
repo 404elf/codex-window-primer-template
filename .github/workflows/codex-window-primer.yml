@@ -29,7 +29,7 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
-          persist-credentials: true
+          persist-credentials: false
 
       - name: Decide whether this run is due
         id: gate
@@ -40,8 +40,8 @@ jobs:
           python3 - <<'PY'
           import json
           import os
-          from datetime import date, datetime, timedelta
-          from zoneinfo import ZoneInfo
+          from datetime import datetime
+          from schedule_logic import due_window, validate_plan
 
           with open(os.environ["PLAN_FILE"], "r", encoding="utf-8") as handle:
               plan = json.load(handle)
@@ -52,56 +52,21 @@ jobs:
                   output.write("should_run=false\n")
               raise SystemExit(0)
 
+          try:
+              timing = validate_plan(plan)
+          except (KeyError, TypeError, ValueError):
+              raise SystemExit("Invalid schedule configuration")
+
+          now = datetime.now(timing.zone)
           if os.environ["EVENT_NAME"] == "workflow_dispatch":
+              due = True
+              primer = timing.primer
               print("Manual run requested; bypassing only the calendar gate.")
-              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
-                  output.write("should_run=true\n")
-              raise SystemExit(0)
-
-          timezone = ZoneInfo(plan["timezone"])
-          now = datetime.now(timezone)
-          work_start = datetime.fromisoformat(plan["work_start_local"]).astimezone(timezone)
-          window_duration = timedelta(minutes=int(plan.get("window_duration_minutes", 300)))
-          reset_after_start = timedelta(minutes=int(plan.get("reset_after_start_minutes", 90)))
-          if window_duration <= timedelta(0) or reset_after_start < timedelta(0) or reset_after_start >= window_duration:
-              raise SystemExit("Invalid window/reset timing configuration")
-          primer = work_start - (window_duration - reset_after_start)
-          mode = plan["mode"]
-          tolerance_before = timedelta(minutes=10)
-          tolerance_after = timedelta(hours=2)
-          due = False
-
-          active_from = date.fromisoformat(plan["active_from_local"])
-          active_until_value = plan.get("active_until_local")
-          active_until = date.fromisoformat(active_until_value) if active_until_value else None
-          skipped_dates = {date.fromisoformat(value) for value in plan.get("skip_dates_local", [])}
-
-          if mode == "once":
-              due = (
-                  primer - tolerance_before <= now <= primer + tolerance_after
-                  and work_start.date() not in skipped_dates
-              )
-          elif mode in {"daily", "weekly"}:
-              target_time = work_start.timetz().replace(tzinfo=None)
-              for day_delta in range(-2, 3):
-                  candidate_work_date = now.date() + timedelta(days=day_delta)
-                  if mode == "weekly" and candidate_work_date.weekday() != work_start.weekday():
-                      continue
-                  if candidate_work_date < active_from or (active_until and candidate_work_date > active_until):
-                      continue
-                  if candidate_work_date in skipped_dates:
-                      continue
-                  candidate_work_start = datetime.combine(candidate_work_date, target_time, tzinfo=timezone)
-                  candidate_primer = candidate_work_start - (window_duration - reset_after_start)
-                  if candidate_primer - tolerance_before <= now <= candidate_primer + tolerance_after:
-                      due = True
-                      primer = candidate_primer
-                      break
           else:
-              raise SystemExit(f"Unsupported schedule mode: {mode}")
+              due, primer = due_window(plan, now)
 
           print(f"Configured timezone: {plan['timezone']}; current local time: {now.isoformat()}")
-          print(f"Computed prime time: {primer.isoformat()}; mode: {mode}; due: {str(due).lower()}")
+          print(f"Computed prime time: {primer.isoformat()}; mode: {plan['mode']}; due: {str(due).lower()}")
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
               output.write(f"should_run={str(due).lower()}\n")
           PY
@@ -120,13 +85,25 @@ jobs:
           npm install --global --no-audit --no-fund "@openai/codex@${CODEX_CLI_VERSION}"
           codex --version >/dev/null
 
-      - name: Prime Codex and persist refreshed credential bundle
+      - name: Decrypt OAuth state and derive age recipient
         if: steps.gate.outputs.should_run == 'true'
         env:
           AGE_PRIVATE_KEY: ${{ secrets.AGE_PRIVATE_KEY }}
         run: |
           set -euo pipefail
           umask 077
+
+          key_file="$RUNNER_TEMP/age-key.txt"
+          recipient_file="$RUNNER_TEMP/age-recipient.txt"
+          codex_home="$RUNNER_TEMP/codex-home"
+          base_commit_file="$RUNNER_TEMP/base-commit.txt"
+          base_auth_blob_file="$RUNNER_TEMP/base-auth-blob.txt"
+          auth_before_file="$RUNNER_TEMP/auth-before.sha256"
+
+          remove_private_key() {
+            rm -f "$key_file"
+          }
+          trap remove_private_key EXIT
 
           if [[ -z "${AGE_PRIVATE_KEY:-}" ]]; then
             echo "::error::The AGE_PRIVATE_KEY repository secret is not configured."
@@ -137,16 +114,6 @@ jobs:
             exit 1
           fi
 
-          key_file="$RUNNER_TEMP/age-key.txt"
-          codex_home="$RUNNER_TEMP/codex-home"
-          codex_output="$RUNNER_TEMP/codex-output.txt"
-          codex_error="$RUNNER_TEMP/codex-error.txt"
-          cleanup() {
-            rm -f "$key_file" "$codex_output" "$codex_error"
-            rm -rf "$codex_home"
-          }
-          trap cleanup EXIT
-
           mkdir -p "$codex_home"
           chmod 700 "$codex_home"
           printf '%s\n' "$AGE_PRIVATE_KEY" > "$key_file"
@@ -155,25 +122,63 @@ jobs:
           cat > "$codex_home/config.toml" <<'EOF'
           cli_auth_credentials_store = "file"
           model_reasoning_effort = "low"
+          allow_login_shell = false
+
+          [shell_environment_policy]
+          inherit = "core"
+          ignore_default_excludes = false
+          include_only = ["CODEX_HOME", "HOME", "PATH", "TMPDIR", "LANG", "LC_*", "TERM"]
           EOF
 
-          age --decrypt \
+          if ! age --decrypt \
             --identity "$key_file" \
             --output "$codex_home/auth.json" \
-            auth.json.enc
+            auth.json.enc >/dev/null 2>&1; then
+            echo "::error::Encrypted Codex credential bundle could not be decrypted."
+            exit 1
+          fi
           chmod 600 "$codex_home/auth.json"
-          before_sha="$(sha256sum "$codex_home/auth.json" | cut -d' ' -f1)"
 
-          export CODEX_HOME="$codex_home"
+          if ! recipient="$(age-keygen -y < "$key_file")"; then
+            echo "::error::The age recipient could not be derived."
+            exit 1
+          fi
+          printf '%s\n' "$recipient" > "$recipient_file"
+          chmod 600 "$recipient_file"
+          git rev-parse HEAD > "$base_commit_file"
+          git rev-parse HEAD:auth.json.enc > "$base_auth_blob_file"
+          sha256sum "$codex_home/auth.json" | cut -d' ' -f1 > "$auth_before_file"
+
+          remove_private_key
+          trap - EXIT
+          unset AGE_PRIVATE_KEY
+          test ! -e "$key_file"
+          echo "OAuth state decrypted; private age key removed before Codex execution."
+
+      - name: Run one quiet Codex request
+        if: steps.gate.outputs.should_run == 'true'
+        env:
+          CODEX_HOME: ${{ runner.temp }}/codex-home
+        run: |
+          set -euo pipefail
+          codex_output="$RUNNER_TEMP/codex-output.txt"
+          codex_error="$RUNNER_TEMP/codex-error.txt"
           set +e
-          codex exec \
-            --model "$CODEX_MODEL" \
-            --config model_reasoning_effort=low \
-            --sandbox read-only \
-            --skip-git-repo-check \
-            --ephemeral \
-            "Reply with exactly: OK" \
-            >"$codex_output" 2>"$codex_error"
+          env -i \
+            HOME="${HOME:-/home/runner}" \
+            PATH="$PATH" \
+            CODEX_HOME="$CODEX_HOME" \
+            TMPDIR="${TMPDIR:-/tmp}" \
+            LANG="${LANG:-C.UTF-8}" \
+            TERM="${TERM:-dumb}" \
+            codex exec \
+              --model "$CODEX_MODEL" \
+              --config model_reasoning_effort=low \
+              --sandbox read-only \
+              --skip-git-repo-check \
+              --ephemeral \
+              "Reply with exactly: OK" \
+              >"$codex_output" 2>"$codex_error"
           codex_status="$?"
           set -e
 
@@ -181,30 +186,124 @@ jobs:
             echo "::error::Codex invocation failed; response and diagnostic output were suppressed."
             exit "$codex_status"
           fi
-
-          if [[ ! -s "$codex_home/auth.json" ]]; then
+          if [[ ! -s "$CODEX_HOME/auth.json" ]]; then
             echo "::error::Codex credential file was not preserved; response output was suppressed."
             exit 1
           fi
+          echo "Codex invocation succeeded; response output was suppressed."
 
-          after_sha="$(sha256sum "$codex_home/auth.json" | cut -d' ' -f1)"
-          if [[ "$before_sha" != "$after_sha" ]]; then
-            recipient="$(age-keygen -y < "$key_file")"
-            age --encrypt \
-              --recipient "$recipient" \
-              --output "$RUNNER_TEMP/auth.json.enc" \
-              "$codex_home/auth.json"
-            test -s "$RUNNER_TEMP/auth.json.enc"
-            mv "$RUNNER_TEMP/auth.json.enc" auth.json.enc
-
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add auth.json.enc
-            git commit -m "chore: refresh encrypted Codex auth bundle"
-            git push origin "HEAD:${GITHUB_REF_NAME}"
-            echo "Codex invocation succeeded; refreshed credentials were saved as ciphertext."
-          else
-            echo "Codex invocation succeeded; encrypted credential bundle was unchanged."
+      - name: Re-encrypt refreshed state without GitHub token
+        id: state
+        if: steps.gate.outputs.should_run == 'true'
+        env:
+          CODEX_HOME: ${{ runner.temp }}/codex-home
+        run: |
+          set -euo pipefail
+          before_sha="$(cat "$RUNNER_TEMP/auth-before.sha256")"
+          after_sha="$(sha256sum "$CODEX_HOME/auth.json" | cut -d' ' -f1)"
+          if [[ "$before_sha" == "$after_sha" ]]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Encrypted credential bundle was unchanged."
+            exit 0
           fi
 
-          echo "Prime completed with official Codex CLI ${CODEX_CLI_VERSION}, model ${CODEX_MODEL}, and low reasoning; response output was suppressed."
+          recipient="$(cat "$RUNNER_TEMP/age-recipient.txt")"
+          if ! age --encrypt \
+            --recipient "$recipient" \
+            --output "$RUNNER_TEMP/auth.json.enc.next" \
+            "$CODEX_HOME/auth.json" >/dev/null 2>&1; then
+            echo "::error::Refreshed OAuth state could not be re-encrypted."
+            exit 1
+          fi
+          test -s "$RUNNER_TEMP/auth.json.enc.next"
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "Refreshed OAuth state was encrypted with the saved public recipient."
+
+      - name: Rebase and push refreshed ciphertext
+        id: persist
+        if: steps.gate.outputs.should_run == 'true' && steps.state.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          echo "conflict=false" >> "$GITHUB_OUTPUT"
+          branch="$GITHUB_REF_NAME"
+          recovery_branch="codex-auth-recovery-${GITHUB_RUN_ID}"
+
+          if [[ -z "${GH_TOKEN:-}" ]]; then
+            echo "::error::GitHub push authorization was unavailable."
+            exit 1
+          fi
+          if git config --show-origin --get-regexp 'http\..*extraheader' >/dev/null 2>&1; then
+            echo "::error::A persistent GitHub authorization header was found in git config."
+            exit 1
+          fi
+
+          auth_header="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0="http.https://github.com/.extraheader"
+          export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth_header"
+          export GIT_TERMINAL_PROMPT=0
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          base_commit="$(cat "$RUNNER_TEMP/base-commit.txt")"
+          base_auth_blob="$(cat "$RUNNER_TEMP/base-auth-blob.txt")"
+          if [[ "$(git rev-parse HEAD)" != "$base_commit" ]]; then
+            echo "::error::The checked-out commit changed unexpectedly; main was not updated."
+            exit 1
+          fi
+          if [[ -n "$(git status --porcelain --untracked-files=all)" ]]; then
+            echo "::error::Unexpected workspace changes were found; main was not updated."
+            exit 1
+          fi
+
+          if ! git fetch --no-tags origin "$branch" >/dev/null 2>&1; then
+            echo "::error::The latest remote branch could not be fetched; main was not updated."
+            exit 1
+          fi
+          remote_head="$(git rev-parse "origin/$branch")"
+          if ! remote_auth_blob="$(git rev-parse "$remote_head:auth.json.enc" 2>/dev/null)"; then
+            echo "::error::The remote encrypted credential bundle could not be inspected; main was not updated."
+            exit 1
+          fi
+
+          preserve_conflict() {
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+            cp "$RUNNER_TEMP/auth.json.enc.next" auth.json.enc
+            if ! git add auth.json.enc || ! git commit -m "chore: preserve encrypted Codex auth recovery state" >/dev/null 2>&1; then
+              echo "::error::Remote state changed; main was not updated, and encrypted recovery preservation failed."
+              exit 1
+            fi
+            if git push origin "HEAD:refs/heads/$recovery_branch" >/dev/null 2>&1; then
+              echo "::error::Remote state changed; main was not updated. Encrypted recovery state was saved to a temporary private branch."
+            else
+              echo "::error::Remote state changed; main was not updated, and encrypted recovery preservation failed."
+            fi
+            exit 1
+          }
+
+          if [[ "$remote_auth_blob" != "$base_auth_blob" ]]; then
+            preserve_conflict
+          fi
+
+          cp "$RUNNER_TEMP/auth.json.enc.next" auth.json.enc
+          git add auth.json.enc
+          git commit -m "chore: refresh encrypted Codex auth bundle" >/dev/null 2>&1
+
+          if ! git rebase "origin/$branch" >/dev/null 2>&1; then
+            git rebase --abort >/dev/null 2>&1 || true
+            preserve_conflict
+          fi
+          if ! git push origin "HEAD:$branch" >/dev/null 2>&1; then
+            preserve_conflict
+          fi
+          echo "Codex invocation succeeded; refreshed credentials were saved as ciphertext after a safe rebase."
+
+      - name: Remove runner-local credential state
+        if: always()
+        run: |
+          set -euo pipefail
+          rm -f "$RUNNER_TEMP/age-key.txt" "$RUNNER_TEMP/age-recipient.txt" "$RUNNER_TEMP/base-commit.txt" "$RUNNER_TEMP/base-auth-blob.txt" "$RUNNER_TEMP/auth-before.sha256" "$RUNNER_TEMP/auth.json.enc.next" "$RUNNER_TEMP/codex-output.txt" "$RUNNER_TEMP/codex-error.txt"
+          rm -rf "$RUNNER_TEMP/codex-home"
