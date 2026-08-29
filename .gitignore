@@ -1,0 +1,9 @@
+# Never stage plaintext Codex credentials or local key material.
+auth.json
+age-key.txt
+*.agekey
+.codex/
+__pycache__/
+
+# Local bootstrap scratch files.
+work/
