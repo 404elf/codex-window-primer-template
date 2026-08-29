@@ -1,6 +1,6 @@
 # One-time private runtime bootstrap on Windows
 
-Do this once on a trusted computer, after copying the public template into your own **Private** GitHub repository. After this boundary is complete, use `tools/codex_window.py` through Codex; do not edit YAML, cron, UTC values, or credential files by hand.
+Do this once on a trusted computer, after copying the public template into your own **Private** GitHub repository. After this boundary is complete, tell Codex your work intent; do not edit YAML, cron, UTC values, or credential files by hand.
 
 ## 1. Prepare an isolated Codex login
 
@@ -56,13 +56,7 @@ Do not run `git add -A` until you have checked that the plaintext credential and
 
 ## 5. Set the first schedule without editing YAML
 
-Tell Codex the work time. It should call the controller, for example:
-
-```text
-python tools/codex_window.py set --work-start 2030-01-02T10:00 --reset-after 1h30m
-```
-
-The controller updates `schedule.json`, converts Beijing time to the UTC cron GitHub requires, pushes the change, and verifies the remote workflow. `status` checks the resulting plan without revealing credential values.
+Tell Codex the work time in natural language. Codex updates `schedule.json` and the one marked workflow cron together, computes the Beijing-to-UTC conversion, pushes only those ordinary configuration changes, and verifies the remote workflow. It must not read or modify any credential file.
 
 ## 6. Test twice
 

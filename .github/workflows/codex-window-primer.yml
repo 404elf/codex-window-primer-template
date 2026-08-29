@@ -15,7 +15,7 @@ concurrency:
 
 env:
   CODEX_MODEL: gpt-5.6-luna
-  CODEX_IMAGE: ghcr.io/icoretech/codex-docker:0.150.1@sha256:cff8e01c6da50536300a842686ac182ebde13ea51f6c6e0bbedfdfd052c81986
+  CODEX_CLI_VERSION: 0.150.1
   PLAN_FILE: schedule.json
 
 jobs:
@@ -113,6 +113,13 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends age
 
+      - name: Install pinned official Codex CLI
+        if: steps.gate.outputs.should_run == 'true'
+        run: |
+          set -euo pipefail
+          npm install --global --no-audit --no-fund "@openai/codex@${CODEX_CLI_VERSION}"
+          codex --version >/dev/null
+
       - name: Prime Codex and persist refreshed credential bundle
         if: steps.gate.outputs.should_run == 'true'
         env:
@@ -157,15 +164,9 @@ jobs:
           chmod 600 "$codex_home/auth.json"
           before_sha="$(sha256sum "$codex_home/auth.json" | cut -d' ' -f1)"
 
+          export CODEX_HOME="$codex_home"
           set +e
-          docker run --rm \
-            --user "$(id -u):$(id -g)" \
-            --env CODEX_HOME=/home/codex/.codex \
-            --env HOME=/tmp \
-            --volume "$codex_home:/home/codex/.codex" \
-            --workdir /tmp \
-            "$CODEX_IMAGE" \
-            exec \
+          codex exec \
             --model "$CODEX_MODEL" \
             --config model_reasoning_effort=low \
             --sandbox read-only \
@@ -206,4 +207,4 @@ jobs:
             echo "Codex invocation succeeded; encrypted credential bundle was unchanged."
           fi
 
-          echo "Prime completed with the pinned Codex container, model ${CODEX_MODEL}, and low reasoning; response output was suppressed."
+          echo "Prime completed with official Codex CLI ${CODEX_CLI_VERSION}, model ${CODEX_MODEL}, and low reasoning; response output was suppressed."
