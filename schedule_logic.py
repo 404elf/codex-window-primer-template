@@ -1,7 +1,7 @@
 """Pure schedule calculations shared by the workflow and its tests.
 
 This module has no GitHub, filesystem, or credential behavior. It only turns
-the structured local-time plan into a prime time, due decision, or UTC cron.
+the structured local-time plan into a prime time, due decision, or local cron.
 """
 
 from __future__ import annotations
@@ -116,13 +116,13 @@ def cron_for(plan: dict) -> str:
     if not plan.get("enabled", False):
         return INERT_CRON
     timing = validate_plan(plan)
-    utc_primer = timing.primer.astimezone(timezone.utc)
-    minute, hour = utc_primer.minute, utc_primer.hour
+    local_primer = timing.primer
+    minute, hour = local_primer.minute, local_primer.hour
     if plan["mode"] == "once":
-        return f"{minute} {hour} {utc_primer.day} {utc_primer.month} *"
+        return f"{minute} {hour} {local_primer.day} {local_primer.month} *"
     if plan["mode"] == "daily":
         return f"{minute} {hour} * * *"
-    github_weekday = (utc_primer.weekday() + 1) % 7
+    github_weekday = (local_primer.weekday() + 1) % 7
     return f"{minute} {hour} * * {github_weekday}"
 
 

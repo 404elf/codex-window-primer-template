@@ -4,6 +4,7 @@ on:
   schedule:
     # codex-window-primer: cron-managed
     - cron: "0 0 1 1 *"
+      timezone: "Asia/Shanghai"
   workflow_dispatch:
 
 permissions:
@@ -156,6 +157,7 @@ jobs:
           echo "OAuth state decrypted; private age key removed before Codex execution."
 
       - name: Run one quiet Codex request
+        id: codex
         if: steps.gate.outputs.should_run == 'true'
         env:
           CODEX_HOME: ${{ runner.temp }}/codex-home
@@ -181,28 +183,38 @@ jobs:
               >"$codex_output" 2>"$codex_error"
           codex_status="$?"
           set -e
+          echo "codex_status=$codex_status" >> "$GITHUB_OUTPUT"
+          if [[ -s "$CODEX_HOME/auth.json" ]]; then
+            echo "auth_present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "auth_present=false" >> "$GITHUB_OUTPUT"
+          fi
 
           if [[ "$codex_status" -ne 0 ]]; then
-            echo "::error::Codex invocation failed; response and diagnostic output were suppressed."
-            exit "$codex_status"
+            echo "::error::Codex invocation failed; response and diagnostic output were suppressed. Continuing to inspect credential state."
+          else
+            echo "Codex invocation completed; response output was suppressed."
           fi
-          if [[ ! -s "$CODEX_HOME/auth.json" ]]; then
-            echo "::error::Codex credential file was not preserved; response output was suppressed."
-            exit 1
-          fi
-          echo "Codex invocation succeeded; response output was suppressed."
 
       - name: Re-encrypt refreshed state without GitHub token
         id: state
-        if: steps.gate.outputs.should_run == 'true'
+        if: ${{ always() && !cancelled() && steps.gate.outputs.should_run == 'true' }}
         env:
           CODEX_HOME: ${{ runner.temp }}/codex-home
         run: |
           set -euo pipefail
+          echo "changed=false" >> "$GITHUB_OUTPUT"
+          if [[ ! -s "$CODEX_HOME/auth.json" ]]; then
+            echo "::error::Codex credential file was not available for state persistence."
+            exit 0
+          fi
+          if [[ ! -s "$RUNNER_TEMP/auth-before.sha256" ]]; then
+            echo "::error::Credential baseline was not available; refreshed state cannot be safely persisted."
+            exit 1
+          fi
           before_sha="$(cat "$RUNNER_TEMP/auth-before.sha256")"
           after_sha="$(sha256sum "$CODEX_HOME/auth.json" | cut -d' ' -f1)"
           if [[ "$before_sha" == "$after_sha" ]]; then
-            echo "changed=false" >> "$GITHUB_OUTPUT"
             echo "Encrypted credential bundle was unchanged."
             exit 0
           fi
@@ -221,7 +233,7 @@ jobs:
 
       - name: Rebase and push refreshed ciphertext
         id: persist
-        if: steps.gate.outputs.should_run == 'true' && steps.state.outputs.changed == 'true'
+        if: ${{ always() && !cancelled() && steps.gate.outputs.should_run == 'true' && steps.state.outputs.changed == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -268,13 +280,23 @@ jobs:
             echo "::error::The remote encrypted credential bundle could not be inspected; main was not updated."
             exit 1
           fi
-
           preserve_conflict() {
             echo "conflict=true" >> "$GITHUB_OUTPUT"
-            cp "$RUNNER_TEMP/auth.json.enc.next" auth.json.enc
-            if ! git add auth.json.enc || ! git commit -m "chore: preserve encrypted Codex auth recovery state" >/dev/null 2>&1; then
-              echo "::error::Remote state changed; main was not updated, and encrypted recovery preservation failed."
-              exit 1
+            target_blob="$(git hash-object "$RUNNER_TEMP/auth.json.enc.next")"
+            head_blob="$(git rev-parse "HEAD:auth.json.enc" 2>/dev/null || true)"
+            if [[ "$head_blob" != "$target_blob" ]]; then
+              if ! cp "$RUNNER_TEMP/auth.json.enc.next" auth.json.enc || ! git add auth.json.enc; then
+                echo "::error::Remote state changed; main was not updated, and encrypted recovery preservation failed."
+                exit 1
+              fi
+              if git diff --cached --quiet -- auth.json.enc; then
+                echo "::error::Remote state changed; recovery ciphertext was not present in the current HEAD and could not be committed."
+                exit 1
+              fi
+              if ! git commit -m "chore: preserve encrypted Codex auth recovery state" >/dev/null 2>&1; then
+                echo "::error::Remote state changed; main was not updated, and encrypted recovery preservation failed."
+                exit 1
+              fi
             fi
             if git push origin "HEAD:refs/heads/$recovery_branch" >/dev/null 2>&1; then
               echo "::error::Remote state changed; main was not updated. Encrypted recovery state was saved to a temporary private branch."
@@ -290,7 +312,10 @@ jobs:
 
           cp "$RUNNER_TEMP/auth.json.enc.next" auth.json.enc
           git add auth.json.enc
-          git commit -m "chore: refresh encrypted Codex auth bundle" >/dev/null 2>&1
+          if ! git commit -m "chore: refresh encrypted Codex auth bundle" >/dev/null 2>&1; then
+            echo "::error::Refreshed OAuth state could not be committed; main was not updated."
+            exit 1
+          fi
 
           if ! git rebase "origin/$branch" >/dev/null 2>&1; then
             git rebase --abort >/dev/null 2>&1 || true
@@ -300,6 +325,34 @@ jobs:
             preserve_conflict
           fi
           echo "Codex invocation succeeded; refreshed credentials were saved as ciphertext after a safe rebase."
+
+      - name: Finalize Codex result
+        if: ${{ always() && !cancelled() && steps.gate.outputs.should_run == 'true' }}
+        env:
+          CODEX_STATUS: ${{ steps.codex.outputs.codex_status }}
+          AUTH_PRESENT: ${{ steps.codex.outputs.auth_present }}
+          STATE_CHANGED: ${{ steps.state.outputs.changed }}
+          STATE_OUTCOME: ${{ steps.state.outcome }}
+          PERSIST_OUTCOME: ${{ steps.persist.outcome }}
+        run: |
+          set -euo pipefail
+          if [[ "${AUTH_PRESENT:-false}" != "true" ]]; then
+            echo "::error::Codex credential state was not available after the request; workflow failed."
+            exit 1
+          fi
+          if [[ "${STATE_OUTCOME:-failure}" != "success" ]]; then
+            echo "::error::Credential state inspection or re-encryption failed; workflow failed."
+            exit 1
+          fi
+          if [[ "${STATE_CHANGED:-false}" == "true" && "${PERSIST_OUTCOME:-failure}" != "success" ]]; then
+            echo "::error::Refreshed credential state was not safely persisted; workflow failed."
+            exit 1
+          fi
+          if [[ "${CODEX_STATUS:-1}" != "0" ]]; then
+            echo "::error::Codex request failed after credential-state handling; workflow failed."
+            exit 1
+          fi
+          echo "Codex invocation succeeded; credential state handling completed."
 
       - name: Remove runner-local credential state
         if: always()

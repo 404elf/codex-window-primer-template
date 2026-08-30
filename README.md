@@ -13,7 +13,7 @@ Tell Codex your work time
           ↓
 Codex calculates the prime time
           ↓
-Private GitHub Actions wakes at the UTC cron
+Private GitHub Actions wakes at the marked local-time cron
           ↓
 One tiny OAuth-authenticated Codex request
           ↓
@@ -41,10 +41,10 @@ Never put `auth.json`, an OAuth access or refresh token, an account identifier, 
 1. Use this template to create a new **Private** GitHub repository for your runtime. Do not make that runtime repository public.
 2. On a trusted computer, install Git, Python 3.11+, the official `age` binary, GitHub CLI, and Codex CLI.
 3. Follow [docs/bootstrap-windows.md](docs/bootstrap-windows.md) once. It logs Codex in under an isolated `CODEX_HOME`, encrypts the resulting OAuth file, and adds only the age private key as a GitHub Actions Secret. No API key is used.
-4. Tell Codex your work time. Codex updates the structured plan and the one marked cron line, converts Beijing time to UTC, commits and pushes the change, and verifies the remote workflow.
+4. Tell Codex your work time. Codex updates the structured plan and the one marked cron/timezone entry, commits and pushes the change, and verifies the remote workflow.
 5. Run the workflow manually twice, waiting for each run to finish. Check that both runs succeed and that no secret appears in the logs.
 
-After setup, users should not edit YAML, cron, UTC values, or authentication files. Codex is the normal human-facing control entry point and directly maintains the two ordinary schedule files.
+After setup, users should not edit YAML, cron, timezone values, or authentication files. Codex is the normal human-facing control entry point and directly maintains the two ordinary schedule files.
 
 ## Everyday control through Codex
 
@@ -60,7 +60,7 @@ Examples of intent and the operation Codex should perform:
 | “暂停” / “恢复” | disable or re-enable the existing plan |
 | “看看现在安排了什么” | show local plan and verify the remote workflow |
 
-It supports one-time, daily, and weekly plans; skips a single date for recurring plans; handles a prime time crossing midnight; and keeps all local-time intent in `schedule.json`. The only workflow edit Codex makes is the marked cron line.
+It supports one-time, daily, and weekly plans; skips a single date for recurring plans; handles a prime time crossing midnight; and keeps all local-time intent in `schedule.json`. The only workflow edit Codex makes is the marked cron/timezone entry. GitHub's native IANA timezone keeps recurring plans at the requested local time across DST changes.
 
 ## Why OAuth state is saved
 
@@ -96,7 +96,7 @@ It never force-pushes or claims success after a failed persistence operation.
 
 ## Change, pause, or remove a plan
 
-Tell Codex the new natural-language intent. It must update both schedule files and report the computed Beijing prime time, UTC cron, and remote verification result. `pause` keeps the plan but disables both scheduled and manual execution; `resume` restores its computed cron. `cancel` without a date pauses the whole plan; with a date it skips that date for a recurring plan.
+Tell Codex the new natural-language intent. It must update both schedule files and report the computed local prime time, cron/timezone entry, and remote verification result. `pause` keeps the plan but disables both scheduled and manual execution; `resume` restores its computed cron. `cancel` without a date pauses the whole plan; with a date it skips that date for a recurring plan.
 
 To uninstall, first pause the plan, wait for any active run to finish, remove the GitHub Secret and encrypted bundle, then delete the private runtime repository. Delete the public template only if you also want to remove the source; no credential is stored there.
 
