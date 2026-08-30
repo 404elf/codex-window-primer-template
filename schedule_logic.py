@@ -369,7 +369,8 @@ def _github_weekday(work_date: date) -> int:
     return (work_date.weekday() + 1) % 7
 
 
-def _cron_layout(normalized: NormalizedPlan) -> _CronLayout:
+def _cron_layout(normalized: NormalizedPlan, now: datetime | None = None) -> _CronLayout:
+    local_now = _local_now(now, normalized.zone) if now is not None else None
     recurring_by_time: dict[tuple[int, int], set[int]] = defaultdict(set)
     for weekday, specs in enumerate(normalized.weekly):
         reference_date = _REFERENCE_MONDAY + timedelta(days=weekday)
@@ -392,6 +393,8 @@ def _cron_layout(normalized: NormalizedPlan) -> _CronLayout:
     for work_date in sorted(normalized.dates):
         for instance in _instances_for_date(normalized, work_date):
             primer = instance.primer
+            if local_now is not None and primer < local_now:
+                continue
             key = (primer.date(), primer.minute, primer.hour)
             if (primer.minute, primer.hour, _github_weekday(primer.date())) in recurring:
                 continue
@@ -410,17 +413,19 @@ def _cron_layout(normalized: NormalizedPlan) -> _CronLayout:
     return _CronLayout(unique_entries, recurring, dated)
 
 
-def cron_entries(plan: dict) -> tuple[str, ...]:
+def cron_entries(plan: dict, now: datetime | None = None) -> tuple[str, ...]:
+    """Return the minimal wake-up projection, omitting already-passed dates."""
+
     normalized = _normalize(plan)
     if not normalized.enabled:
         return (INERT_CRON,)
     _require_slots(normalized)
-    layout = _cron_layout(normalized)
+    layout = _cron_layout(normalized, now=now)
     return layout.entries or (INERT_CRON,)
 
 
-def cron_for(plan: dict) -> str:
-    entries = cron_entries(plan)
+def cron_for(plan: dict, now: datetime | None = None) -> str:
+    entries = cron_entries(plan, now=now)
     if len(entries) != 1:
         raise ValueError("plan has multiple cron entries; use cron_entries")
     return entries[0]
@@ -436,6 +441,30 @@ def _wakeup_for_instance(layout: _CronLayout, instance: ScheduledSlot) -> str | 
     if recurring is not None:
         return recurring
     return layout.dated.get((primer.date(), primer.minute, primer.hour))
+
+
+def today_prime_action(plan: dict, now: datetime) -> str:
+    """Classify an explicit today's date rule as schedule, dispatch, or none.
+
+    This is a pure decision helper for the natural-language controller. It
+    never dispatches anything itself. A dated rule whose prime is still ahead
+    uses the normal cron path; once all of its effective primes have passed,
+    the caller may use the existing workflow_dispatch path if the user's
+    wording clearly says that today's work should still happen.
+    """
+
+    normalized = _normalize(plan)
+    if not normalized.enabled:
+        return "none"
+    local_now = _local_now(now, normalized.zone)
+    if local_now.date() not in normalized.dates:
+        return "none"
+    instances = _instances_for_date(normalized, local_now.date())
+    if not instances:
+        return "none"
+    if any(instance.primer >= local_now for instance in instances):
+        return "schedule"
+    return "dispatch"
 
 
 def due_slots(

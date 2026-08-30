@@ -6,11 +6,13 @@ from pathlib import Path
 from unittest.mock import patch
 
 from schedule_logic import (
+    INERT_CRON,
     cron_entries,
     cron_for,
     due_slots,
     due_window,
     prime_time,
+    today_prime_action,
     validate_plan,
 )
 
@@ -194,7 +196,7 @@ class ScheduleTests(unittest.TestCase):
         schedule = json.loads((root / "schedule.json").read_text(encoding="utf-8"))
         workflow = (root / ".github" / "workflows" / "codex-window-primer.yml").read_text(encoding="utf-8")
         matches = re.findall(
-            r'^[ \t]*- cron: "([^"]+)"\r?\n[ \t]+timezone: "([^\"]+)"',
+            r'^[ \t]*- cron: "([^"]+)"\r?\n[ \t]+timezone: "([^"]+)"',
             workflow,
             re.MULTILINE,
         )
@@ -283,6 +285,22 @@ class ScheduleTests(unittest.TestCase):
         )
         self.assertEqual(len(due), 1)
         self.assertEqual(due[0][0].spec.clock.hour, 14)
+
+    def test_today_temporary_prime_not_yet_uses_normal_cron(self):
+        value = v2_plan(
+            dates={"2030-01-07": {"mode": "override", "slots": ["14:00"]}},
+        )
+        now = datetime(2030, 1, 7, 9, 0, tzinfo=BEIJING)
+        self.assertEqual(today_prime_action(value, now), "schedule")
+        self.assertEqual(cron_entries(value, now=now), ("30 10 7 1 *",))
+
+    def test_today_temporary_prime_already_passed_uses_dispatch_path(self):
+        value = v2_plan(
+            dates={"2030-01-07": {"mode": "override", "slots": ["14:00"]}},
+        )
+        now = datetime(2030, 1, 7, 11, 0, tzinfo=BEIJING)
+        self.assertEqual(today_prime_action(value, now), "dispatch")
+        self.assertEqual(cron_entries(value, now=now), (INERT_CRON,))
 
     def test_v2_date_cancel_day(self):
         value = v2_plan(
@@ -407,6 +425,29 @@ class ScheduleTests(unittest.TestCase):
         )
         self.assertEqual(len(matching), 1)
         self.assertEqual(len(nonmatching), 0)
+
+    def test_append_and_replace_have_distinct_slot_semantics(self):
+        appended = v2_plan(
+            weekly={"0": ["09:00"]},
+            dates={"2030-01-07": {"mode": "extra", "slots": ["20:00"]}},
+        )
+        replaced = v2_plan(
+            weekly={"0": ["09:00"]},
+            dates={"2030-01-07": {"mode": "override", "slots": ["20:00"]}},
+        )
+        appended_slots = due_slots(
+            appended,
+            datetime(2030, 1, 7, 5, 30, tzinfo=BEIJING),
+        ) + due_slots(
+            appended,
+            datetime(2030, 1, 7, 16, 30, tzinfo=BEIJING),
+        )
+        replaced_slots = due_slots(
+            replaced,
+            datetime(2030, 1, 7, 16, 30, tzinfo=BEIJING),
+        )
+        self.assertEqual({slot.spec.clock.hour for slot, _ in appended_slots}, {9, 20})
+        self.assertEqual({slot.spec.clock.hour for slot, _ in replaced_slots}, {20})
 
     def test_v1_migrates_to_equivalent_v2_schedule(self):
         old = plan(mode="daily", active_until_local=None)

@@ -117,6 +117,20 @@ plan scope. Codex keeps the intent in `schedule.json` and updates the marked
 cron projection. GitHub's native IANA timezone keeps recurring plans at the
 requested local time across DST changes.
 
+“也开工” is also additive: it keeps the existing slots and adds the new one.
+
+### A same-day request after its prime time
+
+For an explicit “today temporary start” or “start as soon as possible” request,
+Codex compares the local prime with the current local time. If the prime is
+still ahead, it saves the dated rule and uses the normal cron path. If the
+prime has passed and the wording clearly means that work should still happen
+today, Codex keeps the dated plan, omits the expired date cron, and invokes the
+existing `workflow_dispatch` once as a best-effort prime. It reports that the
+original reset target can no longer be met and that this run's actual window
+starts at dispatch time. No extra workflow, CLI, server, or polling loop is
+introduced.
+
 ## Why OAuth state is saved
 
 Codex OAuth may refresh or rotate credentials while a run is active. The workflow decrypts the private repository's encrypted bundle into a fresh runner-local `CODEX_HOME`, runs one request, detects a changed file, encrypts it again, and pushes only the ciphertext. This prevents the next run from receiving a stale refresh token. The plaintext file and temporary key are removed when the job exits.
