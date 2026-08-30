@@ -203,6 +203,18 @@ class ScheduleTests(unittest.TestCase):
         self.assertIn('if: ${{ always() && !cancelled() && steps.gate.outputs.should_run == \'true\' && steps.state.outputs.changed == \'true\' }}', workflow)
         self.assertIn('if [[ "${CODEX_STATUS:-1}" != "0" ]]; then', workflow)
 
+    def test_command_timeout_still_persists_state_before_final_failure(self):
+        root = Path(__file__).resolve().parents[1]
+        workflow = (root / ".github" / "workflows" / "codex-window-primer.yml").read_text(encoding="utf-8")
+        codex_step = workflow[workflow.index("- name: Run one quiet Codex request"):workflow.index("- name: Re-encrypt refreshed state without GitHub token")]
+        self.assertIn("timeout --signal=TERM --kill-after=15s 3m", codex_step)
+        self.assertLess(codex_step.index("timeout --signal=TERM --kill-after=15s 3m"), codex_step.index("env -i"))
+        self.assertLess(codex_step.index("env -i"), codex_step.index("codex exec"))
+        self.assertIn('echo "codex_status=$codex_status" >> "$GITHUB_OUTPUT"', codex_step)
+        self.assertNotIn('exit "$codex_status"', codex_step)
+        self.assertIn('if: ${{ always() && !cancelled() && steps.gate.outputs.should_run == \'true\' }}', workflow)
+        self.assertIn('if [[ "${CODEX_STATUS:-1}" != "0" ]]; then', workflow)
+
 
 if __name__ == "__main__":
     unittest.main()

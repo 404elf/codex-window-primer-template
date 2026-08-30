@@ -93,6 +93,7 @@ It never force-pushes or claims success after a failed persistence operation.
 - `AGE_PRIVATE_KEY` exists only in the decrypt step; the Codex step uses an explicit `shell_environment_policy` allowlist and `env -i`.
 - `codex-action` and `codex-docker` are audited references only, not runtime dependencies. No remote shell installer is used.
 - GitHub Actions may start late. A late run does not create an additional quota; it only shifts the actual prime time.
+- The job has a 10-minute ceiling and the Codex command has a separate 3-minute timeout. A timed-out request still reaches OAuth-state inspection and persistence; the final step then reports the request failure.
 
 ## Change, pause, or remove a plan
 

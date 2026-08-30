@@ -22,7 +22,8 @@ env:
 jobs:
   prime:
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    # Leave room for the bounded Codex request and OAuth-state persistence.
+    timeout-minutes: 10
     permissions:
       contents: write
     steps:
@@ -166,6 +167,8 @@ jobs:
           codex_output="$RUNNER_TEMP/codex-output.txt"
           codex_error="$RUNNER_TEMP/codex-error.txt"
           set +e
+          # A hung request must not prevent the following state-persistence steps.
+          timeout --signal=TERM --kill-after=15s 3m \
           env -i \
             HOME="${HOME:-/home/runner}" \
             PATH="$PATH" \
