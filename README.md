@@ -28,7 +28,7 @@ prime_time(slot) = work_start(slot) - (window_duration - reset_after_start(slot)
 
 ### v2 多时段计划
 
-schedule.json 是唯一业务 source of truth。weekly 的键为 0=周一 到 6=周日，每天可以有任意多个 HH:MM slot；slot 对象还可以单独覆盖 reset 延迟。dates 的规则优先于 weekly：override 替换当天 slot，extra 追加 slot，cancel 可取消指定时间或整天。prime 跨午夜时，cron 使用前一天的本地日期唤醒。启用且包含 recurring weekly slot 的 v2 计划必须有 `active_from_local`；Codex 创建新 recurring 计划时会自动使用计划时区的当前本地日期。公开 disabled 模板可以保持为 `null`，cron projection 和 collision 检查使用从该日期开始的同一段有限范围。
+schedule.json 是唯一业务 source of truth。weekly 的键为 0=周一 到 6=周日，每天可以有任意多个 HH:MM slot；slot 对象还可以单独覆盖 reset 延迟。dates 的规则优先于 weekly：override 替换当天 slot，extra 追加 slot，cancel 可取消指定时间或整天。prime 跨午夜时，cron 使用前一天的本地日期唤醒。启用且包含 recurring weekly slot 的 v2 计划必须有 `active_from_local`；Codex 创建新 recurring 计划时会自动使用计划时区的当前本地日期。公开 disabled 模板可以保持为 `null`。`active_from_local` / `active_until_local` 只限制 recurring weekly base；显式 dates 规则即使在 active range 外也会生效：override 替换为空的 weekly base，extra 追加到这个空 base，cancel 在当天没有 weekly occurrence 时自然无效果。cron projection、due gate、targeted action 和 collision 检查统一使用这套语义，并从该日期开始使用同一段有限范围。
 
 旧版 v1 的 mode、work_start_local 和 skip_dates_local 仍可直接读取，不需要用户手工迁移。
 
@@ -144,8 +144,13 @@ way.
 An enabled v2 plan with recurring weekly slots must provide
 `active_from_local`; when Codex creates a new recurring plan, it sets this to
 the current local date in the plan timezone. The disabled public template may
-keep it `null`. Cron projection and collision checks use the same bounded range
-anchored at that date, so recurring DST changes are included without polling.
+keep it `null`. `active_from_local` and `active_until_local` limit only the
+recurring weekly base. Explicit dated rules remain effective outside the range:
+`override` replaces an empty weekly base, `extra` appends to that empty base,
+and `cancel` naturally has no effect when there is no weekly occurrence. Cron
+projection, due gating, targeted actions, and collision checks use the same
+semantics and the same bounded range anchored at that date, so recurring DST
+changes are included without polling.
 
 The older v1 fields (`mode`, `work_start_local`, and `skip_dates_local`) are
 still accepted and normalized to the equivalent v2 plan. No credential or

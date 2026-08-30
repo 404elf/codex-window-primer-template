@@ -342,9 +342,14 @@ def _effective_specs(
     *,
     respect_active_range: bool = True,
 ) -> tuple[SlotSpec, ...]:
-    if respect_active_range and not _active(normalized, work_date):
-        return ()
-    specs = list(normalized.weekly[work_date.weekday()])
+    # The active range gates the recurring weekly base only.  A date rule is
+    # an explicit user instruction for this calendar date and must therefore
+    # be applied even when the date is outside that recurring range.
+    specs = list(
+        normalized.weekly[work_date.weekday()]
+        if not respect_active_range or _active(normalized, work_date)
+        else ()
+    )
     rule = normalized.dates.get(work_date)
     if rule is not None:
         if rule.mode == "override":
@@ -611,15 +616,16 @@ def _reference_instances(normalized: NormalizedPlan) -> tuple[ScheduledSlot, ...
             if normalized.active_from is not None:
                 days_until_weekday = (weekday - normalized.active_from.weekday()) % 7
                 candidate = normalized.active_from + timedelta(days=days_until_weekday)
-                if normalized.active_until is None or candidate <= normalized.active_until:
-                    reference_date = candidate
+                reference_date = candidate
+            if normalized.active_until is not None and reference_date > normalized.active_until:
+                # This weekday has no recurring occurrence in the active
+                # range. Explicit date rules are added below independently.
+                continue
             dates_to_check.add(reference_date)
     dates_to_check.update(normalized.dates)
     instances: list[ScheduledSlot] = []
     for work_date in sorted(dates_to_check):
-        instances.extend(
-            _instances_for_date(normalized, work_date, respect_active_range=False)
-        )
+        instances.extend(_instances_for_date(normalized, work_date))
     return tuple(sorted(instances, key=lambda item: (item.work_date, item.spec.clock)))
 
 

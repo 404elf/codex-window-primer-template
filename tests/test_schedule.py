@@ -327,6 +327,137 @@ class ScheduleTests(unittest.TestCase):
         self.assertEqual(len(due), 1)
         self.assertEqual(due[0][0].spec.clock.hour, 14)
 
+    def test_date_override_outside_active_until_is_effective_and_dated(self):
+        value = v2_plan(
+            active_from_local="2030-01-01",
+            active_until_local="2030-01-07",
+            weekly={"0": ["09:00"]},
+            dates={"2030-01-10": {"mode": "override", "slots": ["14:00"]}},
+        )
+        self.assertEqual(self.effective_clocks(value, date(2030, 1, 10)), ("14:00",))
+        self.assertIn("30 10 10 1 *", cron_entries(value))
+        due = due_slots(
+            value,
+            datetime(2030, 1, 10, 10, 30, tzinfo=BEIJING),
+            wakeup_schedule="30 10 10 1 *",
+        )
+        self.assertEqual(len(due), 1)
+        self.assertEqual(due[0][0].spec.clock, time(14))
+
+    def test_date_extra_outside_active_until_appends_to_empty_weekly_base(self):
+        value = v2_plan(
+            active_from_local="2030-01-01",
+            active_until_local="2030-01-07",
+            weekly={"3": ["09:00"]},
+            dates={"2030-01-10": {"mode": "extra", "slots": ["14:00"]}},
+        )
+        self.assertEqual(self.effective_clocks(value, date(2030, 1, 10)), ("14:00",))
+        self.assertIn("30 10 10 1 *", cron_entries(value))
+
+    def test_date_override_before_active_from_is_effective(self):
+        value = v2_plan(
+            active_from_local="2030-01-10",
+            active_until_local=None,
+            weekly={"3": ["09:00"]},
+            dates={"2030-01-05": {"mode": "override", "slots": ["14:00"]}},
+        )
+        self.assertEqual(self.effective_clocks(value, date(2030, 1, 5)), ("14:00",))
+        self.assertIn("30 10 5 1 *", cron_entries(value))
+
+    def test_cancel_outside_active_range_has_no_phantom_slot(self):
+        value = v2_plan(
+            active_from_local="2030-01-01",
+            active_until_local="2030-01-07",
+            weekly={"3": ["09:00"]},
+            dates={"2030-01-10": {"mode": "cancel", "slots": ["14:00"]}},
+        )
+        self.assertEqual(self.effective_clocks(value, date(2030, 1, 10)), ())
+        self.assertNotIn("30 10 10 1 *", cron_entries(value))
+        self.assertEqual(
+            targeted_prime_action(
+                value,
+                datetime(2030, 1, 10, 9, 0, tzinfo=BEIJING),
+                target_date="2030-01-10",
+                targeted_slots=["14:00"],
+            ),
+            "none",
+        )
+
+    def test_targeted_prime_action_works_outside_active_range(self):
+        value = v2_plan(
+            active_from_local="2030-01-01",
+            active_until_local="2030-01-07",
+            weekly={"0": ["09:00"]},
+            dates={"2030-01-10": {"mode": "override", "slots": ["14:00"]}},
+        )
+        self.assertEqual(
+            targeted_prime_action(
+                value,
+                datetime(2030, 1, 10, 9, 0, tzinfo=BEIJING),
+                target_date="2030-01-10",
+            ),
+            "schedule",
+        )
+        self.assertEqual(
+            targeted_prime_action(
+                value,
+                datetime(2030, 1, 10, 11, 0, tzinfo=BEIJING),
+                target_date="2030-01-10",
+            ),
+            "dispatch",
+        )
+
+    def test_dated_cross_midnight_prime_works_outside_active_range(self):
+        value = v2_plan(
+            active_from_local="2030-01-01",
+            active_until_local="2030-01-07",
+            weekly={"0": ["20:00"]},
+            dates={"2030-01-08": {"mode": "override", "slots": ["02:00"]}},
+        )
+        self.assertEqual(self.effective_clocks(value, date(2030, 1, 8)), ("02:00",))
+        now = datetime(2030, 1, 7, 20, 0, tzinfo=BEIJING)
+        self.assertEqual(
+            targeted_prime_action(value, now, target_date="2030-01-08"),
+            "schedule",
+        )
+        self.assertIn("30 22 7 1 *", cron_entries(value, now=now))
+
+    def test_collision_detection_includes_dated_slots_outside_active_range(self):
+        value = v2_plan(
+            active_from_local="2030-01-01",
+            active_until_local="2030-01-07",
+            weekly={"0": ["20:00"]},
+            dates={
+                "2030-01-08": {
+                    "mode": "override",
+                    "slots": [{"time": "02:00", "reset_after_start_minutes": 0}],
+                }
+            },
+        )
+        collisions = find_collisions(value)
+        self.assertTrue(
+            any(
+                item.earlier.work_date == date(2030, 1, 7)
+                and item.later.work_date == date(2030, 1, 8)
+                for item in collisions
+            )
+        )
+
+    def test_apply_date_rule_edit_outside_active_range_is_lossless(self):
+        value = v2_plan(
+            active_from_local="2030-01-01",
+            active_until_local="2030-01-07",
+            weekly={"3": ["09:00"]},
+        )
+        value = apply_date_rule_edit(value, "2030-01-10", "add", ["14:00"])
+        self.assertEqual(self.effective_clocks(value, date(2030, 1, 10)), ("14:00",))
+        self.assertEqual(value["dates"]["2030-01-10"]["mode"], "extra")
+        value = apply_date_rule_edit(value, "2030-01-10", "add", ["18:00"])
+        self.assertEqual(
+            self.effective_clocks(value, date(2030, 1, 10)),
+            ("14:00", "18:00"),
+        )
+
     def test_today_temporary_prime_not_yet_uses_normal_cron(self):
         value = v2_plan(
             dates={"2030-01-07": {"mode": "override", "slots": ["14:00"]}},
