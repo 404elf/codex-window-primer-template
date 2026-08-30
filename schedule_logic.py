@@ -67,6 +67,15 @@ class ScheduledSlot:
 
 
 @dataclass(frozen=True)
+class PrimeCollision:
+    """Two effective prime requests that cannot start independent windows."""
+
+    earlier: ScheduledSlot
+    later: ScheduledSlot
+    gap_minutes: float
+
+
+@dataclass(frozen=True)
 class Timing:
     """Compatibility view retained for callers of the v1 API."""
 
@@ -443,28 +452,167 @@ def _wakeup_for_instance(layout: _CronLayout, instance: ScheduledSlot) -> str | 
     return layout.dated.get((primer.date(), primer.minute, primer.hour))
 
 
-def today_prime_action(plan: dict, now: datetime) -> str:
-    """Classify an explicit today's date rule as schedule, dispatch, or none.
+def _target_clocks(values: object) -> set[time]:
+    if isinstance(values, str):
+        values = [values]
+    if not isinstance(values, (list, tuple, set, frozenset)):
+        raise ValueError("targeted_slots must be a collection of slot times")
+    clocks: set[time] = set()
+    for value in values:
+        if isinstance(value, SlotSpec):
+            clocks.add(value.clock)
+        elif isinstance(value, dict):
+            if "time" not in value:
+                raise ValueError("targeted slot object needs time")
+            clocks.add(_parse_clock(value["time"]))
+        else:
+            clocks.add(_parse_clock(value))
+    return clocks
 
-    This is a pure decision helper for the natural-language controller. It
-    never dispatches anything itself. A dated rule whose prime is still ahead
-    uses the normal cron path; once all of its effective primes have passed,
-    the caller may use the existing workflow_dispatch path if the user's
-    wording clearly says that today's work should still happen.
+
+def today_prime_action(
+    plan: dict,
+    now: datetime,
+    targeted_slots: object | None = None,
+) -> str:
+    """Classify today's explicitly targeted work as schedule, dispatch, or none.
+
+    The natural-language controller calls this after saving a same-day dated
+    rule. With no explicit ``targeted_slots``, only that dated rule's slots
+    are considered; unrelated recurring slots cannot hide a missed target.
+    If several targeted slots are present, a single missed prime still
+    returns ``dispatch`` while future targets remain on the normal cron path.
+    This helper never dispatches anything itself.
     """
 
     normalized = _normalize(plan)
     if not normalized.enabled:
         return "none"
     local_now = _local_now(now, normalized.zone)
-    if local_now.date() not in normalized.dates:
+    date_rule = normalized.dates.get(local_now.date())
+    if date_rule is not None and date_rule.mode == "cancel":
         return "none"
     instances = _instances_for_date(normalized, local_now.date())
+    if targeted_slots is None:
+        if date_rule is None:
+            return "none"
+        target_clocks = {slot.clock for slot in date_rule.slots}
+    else:
+        target_clocks = _target_clocks(targeted_slots)
+    instances = tuple(instance for instance in instances if instance.spec.clock in target_clocks)
     if not instances:
         return "none"
-    if any(instance.primer >= local_now for instance in instances):
-        return "schedule"
-    return "dispatch"
+    if any(instance.primer < local_now for instance in instances):
+        return "dispatch"
+    return "schedule"
+
+
+def _collision_date_intervals(normalized: NormalizedPlan) -> tuple[tuple[date, date], ...]:
+    """Return bounded calendar windows sufficient to inspect recurring and dated slots."""
+
+    padding_days = max(2, ceil(normalized.window_duration.total_seconds() / 86400) + 1)
+    padding = timedelta(days=padding_days)
+    intervals: list[tuple[date, date]] = []
+
+    if any(normalized.weekly):
+        # One calendar year catches DST-only collisions while still being a
+        # small bounded calculation. Active ranges below this span are
+        # filtered by _instances_for_date.
+        recurring_span = timedelta(days=365)
+        if normalized.active_from is not None:
+            weekly_start = normalized.active_from
+        elif normalized.active_until is not None:
+            weekly_start = normalized.active_until - recurring_span
+        else:
+            weekly_start = _REFERENCE_MONDAY
+        if normalized.active_until is not None:
+            latest_start = normalized.active_until - recurring_span
+            weekly_start = min(weekly_start, latest_start)
+        weekly_end = weekly_start + recurring_span
+        intervals.append((weekly_start - padding, weekly_end + padding))
+
+    for work_date in normalized.dates:
+        intervals.append((work_date - padding, work_date + padding))
+
+    if not intervals:
+        return ()
+
+    merged: list[list[date]] = []
+    for start, end in sorted(intervals):
+        if merged and start <= merged[-1][1] + timedelta(days=1):
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    return tuple((start, end) for start, end in merged)
+
+
+def find_collisions(plan: dict) -> tuple[PrimeCollision, ...]:
+    """Find adjacent effective prime requests closer than one usage window.
+
+    Recurring schedules are inspected across a calendar year, while every dated
+    rule is inspected with enough neighboring calendar days to catch
+    cross-midnight and cross-week collisions. Prime instants are ordered on
+    the UTC timeline, so DST transitions use elapsed time rather than a
+    naive wall-clock subtraction. This reports effective occurrences only;
+    a dated override can therefore remove a collision inside its active
+    range without changing unrelated recurring occurrences.
+    """
+
+    normalized = _normalize(plan)
+    if not normalized.enabled:
+        return ()
+    _require_slots(normalized)
+
+    work_dates: set[date] = set()
+    for start, end in _collision_date_intervals(normalized):
+        current = start
+        while current <= end:
+            work_dates.add(current)
+            current += timedelta(days=1)
+
+    instances: dict[tuple[date, time], ScheduledSlot] = {}
+    for work_date in sorted(work_dates):
+        for instance in _instances_for_date(normalized, work_date):
+            instances[(instance.work_date, instance.spec.clock)] = instance
+
+    ordered = sorted(
+        instances.values(),
+        key=lambda instance: instance.primer.astimezone(timezone.utc),
+    )
+    window_seconds = normalized.window_duration.total_seconds()
+    collisions: list[PrimeCollision] = []
+    seen_signatures: set[tuple[object, ...]] = set()
+    for earlier, later in zip(ordered, ordered[1:]):
+        gap_seconds = (
+            later.primer.astimezone(timezone.utc)
+            - earlier.primer.astimezone(timezone.utc)
+        ).total_seconds()
+        if gap_seconds < window_seconds:
+            if earlier.work_date in normalized.dates or later.work_date in normalized.dates:
+                signature: tuple[object, ...] = (
+                    "dated",
+                    earlier.work_date,
+                    earlier.spec.clock,
+                    earlier.spec.reset_after_start_minutes,
+                    later.work_date,
+                    later.spec.clock,
+                    later.spec.reset_after_start_minutes,
+                )
+            else:
+                signature = (
+                    "recurring",
+                    earlier.work_date.weekday(),
+                    earlier.spec.clock,
+                    earlier.spec.reset_after_start_minutes,
+                    later.work_date.weekday(),
+                    later.spec.clock,
+                    later.spec.reset_after_start_minutes,
+                )
+            if signature in seen_signatures:
+                continue
+            seen_signatures.add(signature)
+            collisions.append(PrimeCollision(earlier, later, gap_seconds / 60))
+    return tuple(collisions)
 
 
 def due_slots(

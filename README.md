@@ -53,7 +53,9 @@ schedule.json 是唯一业务 source of truth。weekly 的键为 0=周一 到 6=
 - “暂停 / 恢复” → 禁用/恢复现有计划
 - “看看现在安排了什么” → 查看有效 slot 并验证远端 workflow
 
-如果用户明确说今天临时开工或马上开工，Codex 会比较本地 prime 与当前时间：prime 未到则使用正常 cron；prime 已过且用户仍要今天工作，则保留日期计划、不生成过期日期 cron，并通过现有 workflow_dispatch 做一次 best-effort prime，同时说明原定 reset 目标已无法满足、实际窗口从 dispatch 时间开始。不会新增 CLI、服务器或轮询。
+如果用户明确说今天临时开工或马上开工，Codex 会比较本地 prime 与当前时间：prime 未到则使用正常 cron；prime 已过且用户仍要今天工作，则保留日期计划、不生成过期日期 cron，并通过现有 workflow_dispatch 做一次 best-effort prime，同时说明原定 reset 目标已无法满足。只有当前没有活动中的 5 小时 window 时，新的 window 才会从此次请求开始；如果已有活动中的 window，请求不会重置它，因此原 reset 目标无法保证。不会新增 CLI、服务器或轮询。
+
+保存或修改计划前，Codex 会运行纯调度冲突检查 `find_collisions(plan)`。如果两个相邻 prime 的实际时间间隔小于一个 window，必须说明两个 slot、当地 prime 时间和间隔，并询问保留哪个目标，或明确标记为 best-effort；不能静默声称两个 reset 目标都能满足。每天 09:00 和 20:00 的默认计划不构成冲突。
 
 ### 公共代码与私有状态
 
@@ -194,9 +196,16 @@ still ahead, it saves the dated rule and uses the normal cron path. If the
 prime has passed and the wording clearly means that work should still happen
 today, Codex keeps the dated plan, omits the expired date cron, and invokes the
 existing `workflow_dispatch` once as a best-effort prime. It reports that the
-original reset target can no longer be met and that this run's actual window
-starts at dispatch time. No extra workflow, CLI, server, or polling loop is
-introduced.
+original reset target can no longer be met. A new five-hour window starts with
+this request only when no five-hour window is currently active; an active
+window is not reset by the request, so the original reset target is not
+guaranteed. No extra workflow, CLI, server, or polling loop is introduced.
+
+Before saving a changed plan, Codex runs `find_collisions(plan)`. Any adjacent
+prime requests less than one window apart must be reported with their local
+times and elapsed gap. Codex must ask which target to keep or explicitly mark
+the affected target as best-effort; it must not claim that both reset targets
+are independently guaranteed. The normal 09:00 and 20:00 plan has no collision.
 
 ## Why OAuth state is saved
 

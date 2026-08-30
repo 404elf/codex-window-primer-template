@@ -1,7 +1,7 @@
 import json
 import re
 import unittest
-from datetime import date, datetime, timedelta, timezone, tzinfo
+from datetime import date, datetime, time, timedelta, timezone, tzinfo
 from pathlib import Path
 from unittest.mock import patch
 
@@ -11,6 +11,7 @@ from schedule_logic import (
     cron_for,
     due_slots,
     due_window,
+    find_collisions,
     prime_time,
     today_prime_action,
     validate_plan,
@@ -26,8 +27,13 @@ class NewYorkTestZone(tzinfo):
     def _is_dst(self, value):
         if value is None:
             return False
-        local_date = value.replace(tzinfo=None).date()
-        return date(2030, 3, 10) <= local_date < date(2030, 11, 3)
+        local_value = value.replace(tzinfo=None)
+        local_date = local_value.date()
+        if local_date == date(2030, 3, 10):
+            return local_value.time() >= time(3, 0)
+        if local_date == date(2030, 11, 3):
+            return local_value.time() < time(2, 0)
+        return date(2030, 3, 10) < local_date < date(2030, 11, 3)
 
     def utcoffset(self, value):
         return timedelta(hours=-4 if self._is_dst(value) else -5)
@@ -302,6 +308,54 @@ class ScheduleTests(unittest.TestCase):
         self.assertEqual(today_prime_action(value, now), "dispatch")
         self.assertEqual(cron_entries(value, now=now), (INERT_CRON,))
 
+    def test_today_missed_extra_is_not_hidden_by_future_recurring_slot(self):
+        value = v2_plan(
+            weekly={"0": ["09:00", "20:00"]},
+            dates={"2030-01-07": {"mode": "extra", "slots": ["14:00"]}},
+        )
+        now = datetime(2030, 1, 7, 11, 0, tzinfo=BEIJING)
+        self.assertEqual(today_prime_action(value, now), "dispatch")
+        self.assertEqual(
+            cron_entries(value, now=now),
+            ("30 5 * * 1", "30 16 * * 1"),
+        )
+
+    def test_today_missed_extra_dispatches_once_and_keeps_future_extra_cron(self):
+        value = v2_plan(
+            dates={
+                "2030-01-07": {
+                    "mode": "extra",
+                    "slots": ["14:00", "22:00"],
+                }
+            },
+        )
+        now = datetime(2030, 1, 7, 11, 0, tzinfo=BEIJING)
+        self.assertEqual(today_prime_action(value, now), "dispatch")
+        self.assertEqual(cron_entries(value, now=now), ("30 18 7 1 *",))
+
+    def test_today_cancel_does_not_dispatch(self):
+        value = v2_plan(
+            weekly={"0": ["09:00", "20:00"]},
+            dates={"2030-01-07": {"mode": "cancel"}},
+        )
+        self.assertEqual(
+            today_prime_action(value, datetime(2030, 1, 7, 11, 0, tzinfo=BEIJING)),
+            "none",
+        )
+
+    def test_today_targeted_slot_can_select_one_of_several_targets(self):
+        value = v2_plan(
+            dates={
+                "2030-01-07": {
+                    "mode": "extra",
+                    "slots": ["14:00", "22:00"],
+                }
+            },
+        )
+        now = datetime(2030, 1, 7, 11, 0, tzinfo=BEIJING)
+        self.assertEqual(today_prime_action(value, now, ["14:00"]), "dispatch")
+        self.assertEqual(today_prime_action(value, now, ["22:00"]), "schedule")
+
     def test_v2_date_cancel_day(self):
         value = v2_plan(
             weekly={"0": ["09:00"]},
@@ -406,6 +460,49 @@ class ScheduleTests(unittest.TestCase):
             self.assertEqual(cron_entries(value), ("30 5 * * *",))
         self.assertTrue(before)
         self.assertTrue(after)
+
+    def test_collision_for_slots_inside_one_window(self):
+        value = v2_plan(weekly={"0": ["09:00", "12:00"]})
+        collisions = find_collisions(value)
+        self.assertEqual(len(collisions), 1)
+        self.assertTrue(collisions)
+        self.assertTrue(any(round(item.gap_minutes) == 180 for item in collisions))
+
+    def test_daily_morning_and_evening_slots_do_not_collide(self):
+        value = v2_plan(weekly={str(index): ["09:00", "20:00"] for index in range(7)})
+        self.assertEqual(find_collisions(value), ())
+
+    def test_cross_midnight_collision_is_detected(self):
+        value = v2_plan(
+            weekly={
+                "6": [{"time": "23:30", "reset_after_start_minutes": 240}],
+                "0": [{"time": "02:00", "reset_after_start_minutes": 120}],
+            },
+        )
+        collisions = find_collisions(value)
+        self.assertTrue(any(round(item.gap_minutes) == 30 for item in collisions))
+
+    def test_date_override_can_remove_weekly_collision_in_active_range(self):
+        value = v2_plan(
+            active_from_local="2030-01-07",
+            active_until_local="2030-01-07",
+            weekly={"0": ["09:00", "12:00"]},
+            dates={"2030-01-07": {"mode": "override", "slots": ["09:00"]}},
+        )
+        self.assertEqual(find_collisions(value), ())
+
+    def test_dst_collision_uses_elapsed_timeline(self):
+        value = v2_plan(
+            timezone="America/New_York",
+            active_from_local="2030-03-10",
+            active_until_local="2030-03-10",
+            weekly={"6": ["05:00", "10:30"]},
+        )
+        with patch("schedule_logic._timezone", return_value=NEW_YORK):
+            collisions = find_collisions(value)
+        # Local prime clocks are 01:30 and 07:00 (5h30 wall time), but the
+        # spring-forward transition makes the actual timeline gap 4h30.
+        self.assertTrue(any(round(item.gap_minutes) == 270 for item in collisions))
 
     def test_v2_multiple_wakeups_do_not_duplicate_same_slot(self):
         value = v2_plan(
