@@ -56,7 +56,7 @@ Do not run `git add -A` until you have checked that the plaintext credential and
 
 ## 5. Set the first schedule without editing YAML
 
-Tell Codex the work time in natural language. Codex updates `schedule.json` and the one marked workflow cron/timezone entry together, pushes only those ordinary configuration changes, and verifies the remote workflow. It must not read or modify any credential file.
+Tell Codex the work time in natural language. Codex updates `schedule.json` and all marked workflow cron/timezone entries together, pushes only those ordinary configuration changes, and verifies the remote workflow. It must not read or modify any credential file.
 
 ## 6. Test twice
 

@@ -11,9 +11,9 @@ This small community project sends one minimal Codex request before a planned wo
 ```text
 Tell Codex your work time
           ↓
-Codex calculates the prime time
+Codex writes the structured multi-slot plan
           ↓
-Private GitHub Actions wakes at the marked local-time cron
+Private GitHub Actions wakes at the generated local-time cron entries
           ↓
 One tiny OAuth-authenticated Codex request
           ↓
@@ -22,9 +22,55 @@ The next five-hour window starts earlier
 
 With the default five-hour window and a 1h30m target reset delay:
 
-`prime_time = work_start - (window_duration - reset_after_start)`
+`prime_time(slot) = work_start(slot) - (window_duration - reset_after_start(slot))`
 
 So 10:00 work start → 06:30 prime → approximately 11:30 reset. GitHub Actions scheduling is best-effort, so this is not a second-level timer.
+
+## The schedule model
+
+Version 2 keeps `schedule.json` as the only business source of truth. A plan
+can contain any number of slots on each weekday and dated rules such as:
+
+```json
+{
+  "version": 2,
+  "enabled": true,
+  "timezone": "Asia/Shanghai",
+  "window_duration_minutes": 300,
+  "reset_after_start_minutes": 90,
+  "active_from_local": null,
+  "active_until_local": null,
+  "weekly": {
+    "0": ["09:00", "20:00"],
+    "1": ["09:00", "20:00"],
+    "2": ["09:00", "20:00"],
+    "3": ["09:00", "20:00"],
+    "4": ["09:00", "20:00"],
+    "5": ["11:00"],
+    "6": ["11:00"]
+  },
+  "dates": {
+    "2030-01-07": {"mode": "override", "slots": ["14:00"]},
+    "2030-01-08": {"mode": "extra", "slots": ["22:00"]},
+    "2030-01-09": {"mode": "cancel", "slots": ["09:00"]},
+    "2030-01-10": {"mode": "cancel"}
+  }
+}
+```
+
+`weekly` uses Python weekday numbers: `0` is Monday and `6` is Sunday.
+For a date, `override` replaces the weekly slots, `extra` appends slots, and
+`cancel` with a slot list removes only those clock times; `cancel` without
+`slots` cancels the whole day. A slot object can override the default reset
+delay, for example `{ "time": "20:00", "reset_after_start_minutes": 120 }`.
+The date rules take precedence over recurring rules, so “today temporarily
+starts at 14:00” is represented as a dated rule. A prime time crossing
+midnight belongs to the previous local calendar date and is scheduled that
+way.
+
+The older v1 fields (`mode`, `work_start_local`, and `skip_dates_local`) are
+still accepted and normalized to the equivalent v2 plan. No credential or
+manual migration step is required.
 
 ## Public code and private state
 
@@ -41,7 +87,7 @@ Never put `auth.json`, an OAuth access or refresh token, an account identifier, 
 1. Use this template to create a new **Private** GitHub repository for your runtime. Do not make that runtime repository public.
 2. On a trusted computer, install Git, Python 3.11+, the official `age` binary, GitHub CLI, and Codex CLI.
 3. Follow [docs/bootstrap-windows.md](docs/bootstrap-windows.md) once. It logs Codex in under an isolated `CODEX_HOME`, encrypts the resulting OAuth file, and adds only the age private key as a GitHub Actions Secret. No API key is used.
-4. Tell Codex your work time. Codex updates the structured plan and the one marked cron/timezone entry, commits and pushes the change, and verifies the remote workflow.
+4. Tell Codex your work time. Codex updates the structured plan and all marked cron/timezone entries, commits and pushes the change, and verifies the remote workflow.
 5. Run the workflow manually twice, waiting for each run to finish. Check that both runs succeed and that no secret appears in the logs.
 
 After setup, users should not edit YAML, cron, timezone values, or authentication files. Codex is the normal human-facing control entry point and directly maintains the two ordinary schedule files.
@@ -52,21 +98,30 @@ Examples of intent and the operation Codex should perform:
 
 | You say | Result |
 | --- | --- |
-| “明天 10 点开工” | one-time plan, default 1h30m reset target |
-| “改成下午 2 点” | update the existing plan and cron |
-| “明天希望开工 2 小时后刷新” | recompute prime time with a 2h reset target |
+| “明天 10 点开工” | dated one-time slot, default 1h30m reset target |
+| “每天 9 点和晚上 8 点” | two slots on every weekday |
+| “工作日 9 点，周末 11 点” | weekday/weekend slots |
+| “改成下午 2 点” | replace the relevant existing slot or rule |
+| “再加一个晚上 8 点” | append an extra slot in the same scope |
+| “明天希望开工 2 小时后刷新” | recompute that slot with a 2h reset target |
+| “今天取消” | cancel only today's occurrence |
 | “这周每天 9 点开始” | recurring daily plan for the requested period |
-| “今天取消” | cancel the one-time plan, or skip only today's recurring occurrence |
 | “暂停” / “恢复” | disable or re-enable the existing plan |
-| “看看现在安排了什么” | show local plan and verify the remote workflow |
+| “看看现在安排了什么” | show all effective slots and verify the remote workflow |
 
-It supports one-time, daily, and weekly plans; skips a single date for recurring plans; handles a prime time crossing midnight; and keeps all local-time intent in `schedule.json`. The only workflow edit Codex makes is the marked cron/timezone entry. GitHub's native IANA timezone keeps recurring plans at the requested local time across DST changes.
+It supports daily multi-slot plans, workdays, weekends, selected weekdays,
+dated one-offs, overrides, additions, day/slot cancellations, temporary
+plans, and prime times crossing midnight. “改成” means replacement, “再加一
+个/还要” means addition, and “取消” is limited to the stated date, slot, or
+plan scope. Codex keeps the intent in `schedule.json` and updates the marked
+cron projection. GitHub's native IANA timezone keeps recurring plans at the
+requested local time across DST changes.
 
 ## Why OAuth state is saved
 
 Codex OAuth may refresh or rotate credentials while a run is active. The workflow decrypts the private repository's encrypted bundle into a fresh runner-local `CODEX_HOME`, runs one request, detects a changed file, encrypts it again, and pushes only the ciphertext. This prevents the next run from receiving a stale refresh token. The plaintext file and temporary key are removed when the job exits.
 
-The workflow uses a single concurrency group so two runs cannot refresh the same OAuth state at once. It has only `schedule` and `workflow_dispatch` triggers. There are no Pull Request, Issue, push, reusable-workflow, or external-input credential paths.
+The workflow uses a single concurrency group so two runs cannot refresh the same OAuth state at once. It has only `schedule` and `workflow_dispatch` triggers. There are no Pull Request, Issue, push, reusable-workflow, or external-input credential paths. Multiple cron entries are wake-ups only: the gate compares the event's cron text with the effective slot, so a wake-up for another slot cannot send a duplicate request.
 
 The credential-bearing stages are deliberately separated. Only the decrypt
 stage receives `AGE_PRIVATE_KEY`; it derives and saves the public age
@@ -97,7 +152,7 @@ It never force-pushes or claims success after a failed persistence operation.
 
 ## Change, pause, or remove a plan
 
-Tell Codex the new natural-language intent. It must update both schedule files and report the computed local prime time, cron/timezone entry, and remote verification result. `pause` keeps the plan but disables both scheduled and manual execution; `resume` restores its computed cron. `cancel` without a date pauses the whole plan; with a date it skips that date for a recurring plan.
+Tell Codex the new natural-language intent. It must update both schedule files and report every computed local prime time, cron/timezone entry, and remote verification result. `pause` keeps the plan but disables both scheduled and manual execution; `resume` restores its computed cron entries. `cancel` without a date pauses the whole plan; with a date it creates a dated cancellation, and with a time it cancels only that slot.
 
 To uninstall, first pause the plan, wait for any active run to finish, remove the GitHub Secret and encrypted bundle, then delete the private runtime repository. Delete the public template only if you also want to remove the source; no credential is stored there.
 
@@ -111,7 +166,7 @@ To uninstall, first pause the plan, wait for any active run to finish, remove th
 
 **Why not poll every 30 minutes?** Codex creates only the requested one-time or recurring schedule. There is no background polling loop.
 
-**Why does a one-time plan have a day/month cron?** GitHub Actions has no native one-shot schedule. The calendar gate checks the exact dated plan and prevents later yearly wake-ups from sending a request; Codex can disable the plan after the intended run.
+**Why does a one-time plan have a day/month cron?** GitHub Actions has no native one-shot schedule. The calendar gate checks the exact dated slot and prevents later wake-ups from sending a request; the dated rule then expires naturally.
 
 **Why is there a public template and a private repository?** Source can be audited and shared without exposing the per-user OAuth state or refresh-token history.
 

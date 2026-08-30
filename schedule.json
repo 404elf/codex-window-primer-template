@@ -1,12 +1,11 @@
 {
-  "version": 1,
+  "version": 2,
   "enabled": false,
-  "mode": "once",
   "timezone": "Asia/Shanghai",
   "window_duration_minutes": 300,
   "reset_after_start_minutes": 90,
-  "work_start_local": "2099-01-01T09:00+08:00",
-  "active_from_local": "2099-01-01",
-  "active_until_local": "2099-01-01",
-  "skip_dates_local": []
+  "active_from_local": null,
+  "active_until_local": null,
+  "weekly": {},
+  "dates": {}
 }

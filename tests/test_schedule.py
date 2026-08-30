@@ -5,7 +5,14 @@ from datetime import date, datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from unittest.mock import patch
 
-from schedule_logic import cron_for, due_window, prime_time, validate_plan
+from schedule_logic import (
+    cron_entries,
+    cron_for,
+    due_slots,
+    due_window,
+    prime_time,
+    validate_plan,
+)
 
 
 BEIJING = timezone(timedelta(hours=8), "Asia/Shanghai")
@@ -45,6 +52,22 @@ def plan(**overrides):
         "active_from_local": "2030-01-02",
         "active_until_local": "2030-01-02",
         "skip_dates_local": [],
+    }
+    value.update(overrides)
+    return value
+
+
+def v2_plan(**overrides):
+    value = {
+        "version": 2,
+        "enabled": True,
+        "timezone": "Asia/Shanghai",
+        "window_duration_minutes": 300,
+        "reset_after_start_minutes": 90,
+        "active_from_local": "2030-01-01",
+        "active_until_local": None,
+        "weekly": {},
+        "dates": {},
     }
     value.update(overrides)
     return value
@@ -170,14 +193,256 @@ class ScheduleTests(unittest.TestCase):
         root = Path(__file__).resolve().parents[1]
         schedule = json.loads((root / "schedule.json").read_text(encoding="utf-8"))
         workflow = (root / ".github" / "workflows" / "codex-window-primer.yml").read_text(encoding="utf-8")
-        match = re.search(
-            r'^\s*- cron: "([^"]+)"\s*\n\s+timezone: "([^"]+)"',
+        matches = re.findall(
+            r'^[ \t]*- cron: "([^"]+)"\r?\n[ \t]+timezone: "([^\"]+)"',
             workflow,
             re.MULTILINE,
         )
-        self.assertIsNotNone(match)
-        self.assertEqual(match.group(1), cron_for(schedule))
-        self.assertEqual(match.group(2), schedule["timezone"])
+        self.assertEqual(
+            matches,
+            [(entry, schedule["timezone"]) for entry in cron_entries(schedule)],
+        )
+
+    def test_v2_daily_two_slots(self):
+        value = v2_plan(
+            weekly={str(index): ["09:00", "20:00"] for index in range(7)},
+        )
+        self.assertEqual(cron_entries(value), ("30 5 * * *", "30 16 * * *"))
+        morning, _ = due_window(
+            value,
+            datetime(2030, 1, 7, 5, 30, tzinfo=BEIJING),
+            wakeup_schedule="30 5 * * *",
+        )
+        evening, _ = due_window(
+            value,
+            datetime(2030, 1, 7, 16, 30, tzinfo=BEIJING),
+            wakeup_schedule="30 16 * * *",
+        )
+        self.assertTrue(morning)
+        self.assertTrue(evening)
+
+    def test_v2_weekdays_at_nine(self):
+        value = v2_plan(weekly={str(index): ["09:00"] for index in range(5)})
+        self.assertEqual(cron_entries(value), ("30 5 * * 1,2,3,4,5",))
+        monday, _ = due_window(
+            value,
+            datetime(2030, 1, 7, 5, 30, tzinfo=BEIJING),
+            wakeup_schedule="30 5 * * 1,2,3,4,5",
+        )
+        saturday, _ = due_window(
+            value,
+            datetime(2030, 1, 12, 5, 30, tzinfo=BEIJING),
+            wakeup_schedule="30 5 * * 1,2,3,4,5",
+        )
+        self.assertTrue(monday)
+        self.assertFalse(saturday)
+
+    def test_v2_weekends_at_eleven(self):
+        value = v2_plan(weekly={"5": ["11:00"], "6": ["11:00"]})
+        self.assertEqual(cron_entries(value), ("30 7 * * 0,6",))
+        due, _ = due_window(
+            value,
+            datetime(2030, 1, 6, 7, 30, tzinfo=BEIJING),
+            wakeup_schedule="30 7 * * 0,6",
+        )
+        self.assertTrue(due)
+
+    def test_v2_specific_weekday(self):
+        value = v2_plan(weekly={"2": ["20:00"]})
+        self.assertEqual(cron_entries(value), ("30 16 * * 3",))
+
+    def test_v2_date_override_replaces_weekly(self):
+        value = v2_plan(
+            weekly={"0": ["09:00"]},
+            dates={"2030-01-07": {"mode": "override", "slots": ["14:00"]}},
+        )
+        self.assertEqual(cron_entries(value), ("30 5 * * 1", "30 10 7 1 *"))
+        old_wakeup, _ = due_window(
+            value,
+            datetime(2030, 1, 7, 5, 30, tzinfo=BEIJING),
+            wakeup_schedule="30 5 * * 1",
+        )
+        new_wakeup, _ = due_window(
+            value,
+            datetime(2030, 1, 7, 10, 30, tzinfo=BEIJING),
+            wakeup_schedule="30 10 7 1 *",
+        )
+        self.assertFalse(old_wakeup)
+        self.assertTrue(new_wakeup)
+
+    def test_v2_date_extra_appends_slot(self):
+        value = v2_plan(
+            weekly={"0": ["09:00"]},
+            dates={"2030-01-07": {"mode": "extra", "slots": ["14:00"]}},
+        )
+        self.assertEqual(len(cron_entries(value)), 2)
+        due = due_slots(
+            value,
+            datetime(2030, 1, 7, 10, 30, tzinfo=BEIJING),
+            wakeup_schedule="30 10 7 1 *",
+        )
+        self.assertEqual(len(due), 1)
+        self.assertEqual(due[0][0].spec.clock.hour, 14)
+
+    def test_v2_date_cancel_day(self):
+        value = v2_plan(
+            weekly={"0": ["09:00"]},
+            dates={"2030-01-07": {"mode": "cancel"}},
+        )
+        due, _ = due_window(
+            value,
+            datetime(2030, 1, 7, 5, 30, tzinfo=BEIJING),
+            wakeup_schedule="30 5 * * 1",
+        )
+        self.assertFalse(due)
+        self.assertEqual(cron_entries(value), ("30 5 * * 1",))
+
+    def test_v2_date_cancel_single_slot(self):
+        value = v2_plan(
+            weekly={"0": ["09:00", "20:00"]},
+            dates={"2030-01-07": {"mode": "cancel", "slots": ["09:00"]}},
+        )
+        morning, _ = due_window(
+            value,
+            datetime(2030, 1, 7, 5, 30, tzinfo=BEIJING),
+            wakeup_schedule="30 5 * * 1",
+        )
+        evening, _ = due_window(
+            value,
+            datetime(2030, 1, 7, 16, 30, tzinfo=BEIJING),
+            wakeup_schedule="30 16 * * 1",
+        )
+        self.assertFalse(morning)
+        self.assertTrue(evening)
+
+    def test_v2_one_off_expires(self):
+        value = v2_plan(
+            dates={"2030-01-03": {"mode": "override", "slots": ["14:00"]}},
+        )
+        self.assertEqual(cron_entries(value), ("30 10 3 1 *",))
+        active, _ = due_window(
+            value,
+            datetime(2030, 1, 3, 10, 30, tzinfo=BEIJING),
+            wakeup_schedule="30 10 3 1 *",
+        )
+        expired, _ = due_window(
+            value,
+            datetime(2030, 1, 4, 10, 30, tzinfo=BEIJING),
+            wakeup_schedule="30 10 3 1 *",
+        )
+        self.assertTrue(active)
+        self.assertFalse(expired)
+
+    def test_v2_prime_crosses_midnight(self):
+        value = v2_plan(
+            weekly={"0": [{"time": "02:00", "reset_after_start_minutes": 120}]},
+        )
+        self.assertEqual(cron_entries(value), ("0 23 * * 0",))
+        due, _ = due_window(
+            value,
+            datetime(2030, 1, 6, 23, 0, tzinfo=BEIJING),
+            wakeup_schedule="0 23 * * 0",
+        )
+        self.assertTrue(due)
+
+    def test_v2_weekly_midnight_prime_keeps_timezone(self):
+        value = v2_plan(
+            timezone="America/New_York",
+            weekly={"0": [{"time": "02:00", "reset_after_start_minutes": 120}]},
+        )
+        with patch("schedule_logic._timezone", return_value=NEW_YORK):
+            timing = validate_plan(value)
+            self.assertEqual(timing.primer.date(), date(2030, 1, 6))
+            self.assertEqual((timing.primer.hour, timing.primer.minute), (23, 0))
+            self.assertEqual(timing.primer.tzinfo, NEW_YORK)
+            self.assertEqual(cron_entries(value), ("0 23 * * 0",))
+
+    def test_v2_weekly_multi_slot_with_slot_reset_override(self):
+        value = v2_plan(
+            weekly={
+                "0": ["09:00", {"time": "20:00", "reset_after_start_minutes": 120}],
+                "2": ["09:00"],
+            },
+        )
+        self.assertEqual(
+            cron_entries(value),
+            ("30 5 * * 1,3", "0 17 * * 1"),
+        )
+
+    def test_v2_new_york_dst_keeps_local_prime_time(self):
+        value = v2_plan(
+            timezone="America/New_York",
+            weekly={str(index): ["09:00"] for index in range(7)},
+        )
+        with patch("schedule_logic._timezone", return_value=NEW_YORK):
+            before, _ = due_window(
+                value,
+                datetime(2030, 3, 8, 5, 30, tzinfo=NEW_YORK),
+                wakeup_schedule="30 5 * * *",
+            )
+            after, _ = due_window(
+                value,
+                datetime(2030, 3, 11, 5, 30, tzinfo=NEW_YORK),
+                wakeup_schedule="30 5 * * *",
+            )
+            self.assertEqual(cron_entries(value), ("30 5 * * *",))
+        self.assertTrue(before)
+        self.assertTrue(after)
+
+    def test_v2_multiple_wakeups_do_not_duplicate_same_slot(self):
+        value = v2_plan(
+            weekly={str(index): ["09:00", "20:00"] for index in range(7)},
+        )
+        entries = cron_entries(value)
+        self.assertEqual(len(entries), len(set(entries)))
+        matching = due_slots(
+            value,
+            datetime(2030, 1, 7, 5, 30, tzinfo=BEIJING),
+            wakeup_schedule=entries[0],
+        )
+        nonmatching = due_slots(
+            value,
+            datetime(2030, 1, 7, 5, 30, tzinfo=BEIJING),
+            wakeup_schedule=entries[1],
+        )
+        self.assertEqual(len(matching), 1)
+        self.assertEqual(len(nonmatching), 0)
+
+    def test_v1_migrates_to_equivalent_v2_schedule(self):
+        old = plan(mode="daily", active_until_local=None)
+        new = v2_plan(
+            active_from_local="2030-01-02",
+            weekly={str(index): ["10:00"] for index in range(7)},
+        )
+        self.assertEqual(prime_time(old), prime_time(new))
+        self.assertEqual(cron_entries(old), cron_entries(new))
+        old_due, _ = due_window(old, datetime(2030, 1, 3, 6, 30, tzinfo=BEIJING))
+        new_due, _ = due_window(new, datetime(2030, 1, 3, 6, 30, tzinfo=BEIJING))
+        self.assertEqual(old_due, new_due)
+
+    def test_workflow_uses_event_cron_as_schedule_gate(self):
+        root = Path(__file__).resolve().parents[1]
+        workflow = (root / ".github" / "workflows" / "codex-window-primer.yml").read_text(encoding="utf-8")
+        self.assertIn("WAKEUP_SCHEDULE: ${{ github.event.schedule }}", workflow)
+        self.assertIn("wakeup_schedule=os.environ.get(\"WAKEUP_SCHEDULE\") or None", workflow)
+
+    def test_oauth_and_workflow_security_invariants_remain(self):
+        root = Path(__file__).resolve().parents[1]
+        workflow = (root / ".github" / "workflows" / "codex-window-primer.yml").read_text(encoding="utf-8")
+        trigger_block = workflow[:workflow.index("permissions:")]
+        self.assertIn("schedule:", trigger_block)
+        self.assertIn("workflow_dispatch:", trigger_block)
+        self.assertNotIn("pull_request", trigger_block)
+        self.assertNotIn("issues:", trigger_block)
+        self.assertNotIn("push:", trigger_block)
+        self.assertIn("persist-credentials: false", workflow)
+        self.assertIn("concurrency:", workflow)
+        self.assertIn("cancel-in-progress: false", workflow)
+        self.assertEqual(workflow.count("AGE_PRIVATE_KEY: ${{ secrets.AGE_PRIVATE_KEY }}"), 1)
+        codex_step = workflow[workflow.index("- name: Run one quiet Codex request"):workflow.index("- name: Re-encrypt refreshed state without GitHub token")]
+        self.assertNotIn("AGE_PRIVATE_KEY", codex_step)
+        self.assertIn('env -i \\\n', codex_step)
+        self.assertIn('include_only = ["CODEX_HOME", "HOME", "PATH", "TMPDIR", "LANG", "LC_*", "TERM"]', workflow)
 
     def test_recovery_path_handles_ciphertext_already_in_head(self):
         root = Path(__file__).resolve().parents[1]

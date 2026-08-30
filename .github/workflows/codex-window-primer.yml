@@ -37,6 +37,7 @@ jobs:
         id: gate
         env:
           EVENT_NAME: ${{ github.event_name }}
+          WAKEUP_SCHEDULE: ${{ github.event.schedule }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -65,10 +66,16 @@ jobs:
               primer = timing.primer
               print("Manual run requested; bypassing only the calendar gate.")
           else:
-              due, primer = due_window(plan, now)
+              due, primer = due_window(
+                  plan,
+                  now,
+                  wakeup_schedule=os.environ.get("WAKEUP_SCHEDULE") or None,
+              )
 
           print(f"Configured timezone: {plan['timezone']}; current local time: {now.isoformat()}")
-          print(f"Computed prime time: {primer.isoformat()}; mode: {plan['mode']}; due: {str(due).lower()}")
+          primer_text = primer.isoformat() if primer is not None else "none"
+          plan_kind = plan.get("mode", f"v{plan.get('version', '?')}")
+          print(f"Computed prime time: {primer_text}; plan: {plan_kind}; due: {str(due).lower()}")
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
               output.write(f"should_run={str(due).lower()}\n")
           PY
