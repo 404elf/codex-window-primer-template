@@ -69,7 +69,7 @@ class ScheduledSlot:
     def primer(self) -> datetime:
         lead = self.window_duration - self.spec.reset_after_start
         return (
-            self.work_start.astimezone(timezone.utc) - lead
+            _utc_instant(self.work_start) - lead
         ).astimezone(self.zone)
 
 
@@ -122,6 +122,12 @@ def _timezone(name: str) -> tzinfo:
         raise ValueError("unknown timezone")
 
 
+def _utc_instant(value: datetime) -> datetime:
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("datetime must be timezone-aware")
+    return value.astimezone(timezone.utc)
+
+
 def _resolve_local_wall_datetime(value: datetime, zone: tzinfo) -> datetime:
     """Resolve a local wall time, rejecting gaps and choosing the earlier fold."""
 
@@ -130,7 +136,7 @@ def _resolve_local_wall_datetime(value: datetime, zone: tzinfo) -> datetime:
     for fold in (0, 1):
         candidate = naive.replace(tzinfo=zone, fold=fold)
         round_trip = (
-            candidate.astimezone(timezone.utc)
+            _utc_instant(candidate)
             .astimezone(zone)
             .replace(tzinfo=None)
         )
@@ -141,7 +147,7 @@ def _resolve_local_wall_datetime(value: datetime, zone: tzinfo) -> datetime:
     # An ambiguous wall time has two valid instants. Pick the earlier one
     # explicitly; a caller that needs the later fold must use an explicit
     # offset in the v1 work_start_local value.
-    return min(candidates, key=lambda candidate: candidate.astimezone(timezone.utc))
+    return min(candidates, key=_utc_instant)
 
 
 def _local_datetime(value: str, zone: tzinfo) -> datetime:
@@ -151,7 +157,7 @@ def _local_datetime(value: str, zone: tzinfo) -> datetime:
     # Validate the supplied local wall clock even when the input includes an
     # offset; this rejects a spring-forward gap instead of silently shifting it.
     _resolve_local_wall_datetime(parsed.replace(tzinfo=None), zone)
-    return parsed.astimezone(zone)
+    return _utc_instant(parsed).astimezone(zone)
 
 
 def _integer(value: object, label: str) -> int:
@@ -278,6 +284,8 @@ def _normalize_v2(plan: dict) -> NormalizedPlan:
             raise ValueError("weekly day must be 0 through 6")
         weekday = _integer(key, "weekly day")
         weekly[weekday] = _parse_slot_specs(values, default_reset, window_duration)
+    if enabled and any(weekly) and active_from is None:
+        raise ValueError("enabled recurring v2 plan requires active_from_local")
 
     dates_value = plan.get("dates", {})
     if not isinstance(dates_value, dict):
@@ -439,6 +447,7 @@ def _recurring_projection_dates(normalized: NormalizedPlan) -> tuple[date, date]
 
 def _cron_layout(normalized: NormalizedPlan, now: datetime | None = None) -> _CronLayout:
     local_now = _local_now(now, normalized.zone) if now is not None else None
+    local_now_utc = _utc_instant(local_now) if local_now is not None else None
     recurring_by_time: dict[tuple[int, int], set[int]] = defaultdict(set)
     projection_start, projection_end = _recurring_projection_dates(normalized)
     current = projection_start
@@ -464,7 +473,10 @@ def _cron_layout(normalized: NormalizedPlan, now: datetime | None = None) -> _Cr
     for work_date in sorted(normalized.dates):
         for instance in _instances_for_date(normalized, work_date):
             primer = instance.primer
-            if local_now is not None and primer < local_now:
+            if (
+                local_now_utc is not None
+                and _utc_instant(primer) < local_now_utc + TOLERANCE_BEFORE
+            ):
                 continue
             key = (primer.date(), primer.minute, primer.hour)
             if (primer.minute, primer.hour, _github_weekday(primer.date())) in recurring:
@@ -485,7 +497,7 @@ def _cron_layout(normalized: NormalizedPlan, now: datetime | None = None) -> _Cr
 
 
 def cron_entries(plan: dict, now: datetime | None = None) -> tuple[str, ...]:
-    """Return the minimal wake-up projection, omitting already-passed dates."""
+    """Return wake-ups, omitting expired or dispatch-bound dated prime times."""
 
     normalized = _normalize(plan)
     if not normalized.enabled:
@@ -503,7 +515,7 @@ def cron_for(plan: dict, now: datetime | None = None) -> str:
 
 
 def _local_now(now: datetime, zone: tzinfo) -> datetime:
-    return now.replace(tzinfo=zone) if now.tzinfo is None else now.astimezone(zone)
+    return _resolve_local_wall_datetime(now, zone) if now.tzinfo is None else now.astimezone(zone)
 
 
 def _wakeup_for_instance(layout: _CronLayout, instance: ScheduledSlot) -> str | None:
@@ -532,29 +544,27 @@ def _target_clocks(values: object) -> set[time]:
     return clocks
 
 
-def today_prime_action(
-    plan: dict,
-    now: datetime,
-    targeted_slots: object | None = None,
+def _target_date(value: date | str | None, fallback: date) -> date:
+    if value is None:
+        return fallback
+    if isinstance(value, datetime):
+        raise ValueError("target date must be a date")
+    if isinstance(value, date):
+        return value
+    return _parse_date(value, "target date")
+
+
+def _targeted_prime_action(
+    normalized: NormalizedPlan,
+    local_now: datetime,
+    target_date: date,
+    targeted_slots: object | None,
 ) -> str:
-    """Classify today's explicitly targeted work as schedule, dispatch, or none.
-
-    The natural-language controller calls this after saving a same-day dated
-    rule. With no explicit ``targeted_slots``, only that dated rule's slots
-    are considered; unrelated recurring slots cannot hide a missed target.
-    If several targeted slots are present, a single missed prime still
-    returns ``dispatch`` while future targets remain on the normal cron path.
-    This helper never dispatches anything itself.
-    """
-
-    normalized = _normalize(plan)
-    if not normalized.enabled:
-        return "none"
-    local_now = _local_now(now, normalized.zone)
-    date_rule = normalized.dates.get(local_now.date())
+    date_rule = normalized.dates.get(target_date)
     if date_rule is not None and date_rule.mode == "cancel":
         return "none"
-    instances = _instances_for_date(normalized, local_now.date())
+
+    instances = _instances_for_date(normalized, target_date)
     if targeted_slots is None:
         if date_rule is None:
             return "none"
@@ -564,9 +574,66 @@ def today_prime_action(
     instances = tuple(instance for instance in instances if instance.spec.clock in target_clocks)
     if not instances:
         return "none"
-    if any(instance.primer < local_now for instance in instances):
+
+    now_instant = _utc_instant(local_now)
+    if any(
+        _utc_instant(instance.primer) - now_instant < TOLERANCE_BEFORE
+        for instance in instances
+    ):
         return "dispatch"
     return "schedule"
+
+
+def targeted_prime_action(
+    plan: dict,
+    now: datetime,
+    target_date: date | str | None = None,
+    targeted_slots: object | None = None,
+) -> str:
+    """Classify explicitly targeted dated work as schedule, dispatch, or none.
+
+    ``target_date`` is the work date, not necessarily the local calendar date
+    of its prime. This distinction matters when a dated work slot crosses
+    midnight, for example a 02:00 work start whose prime is on the previous
+    evening. With no explicit ``targeted_slots``, only that date rule's slots
+    are considered; unrelated recurring slots cannot hide a missed target.
+    If several targeted slots are present, one missed or near-term prime still
+    returns ``dispatch`` while future targets remain on the normal cron path.
+    Prime comparisons use UTC instants. This helper never dispatches anything
+    itself.
+    """
+
+    normalized = _normalize(plan)
+    if not normalized.enabled:
+        return "none"
+    local_now = _local_now(now, normalized.zone)
+    resolved_date = _target_date(target_date, local_now.date())
+    return _targeted_prime_action(
+        normalized,
+        local_now,
+        resolved_date,
+        targeted_slots,
+    )
+
+
+def today_prime_action(
+    plan: dict,
+    now: datetime,
+    targeted_slots: object | None = None,
+) -> str:
+    """Backward-compatible wrapper for a target whose work date is today.
+
+    Call :func:`targeted_prime_action` for a dated rule on another work date.
+    """
+
+    normalized = _normalize(plan)
+    local_now = _local_now(now, normalized.zone)
+    return _targeted_prime_action(
+        normalized,
+        local_now,
+        local_now.date(),
+        targeted_slots,
+    )
 
 
 def _collision_date_intervals(normalized: NormalizedPlan) -> tuple[tuple[date, date], ...]:
@@ -577,21 +644,10 @@ def _collision_date_intervals(normalized: NormalizedPlan) -> tuple[tuple[date, d
     intervals: list[tuple[date, date]] = []
 
     if any(normalized.weekly):
-        # One calendar year catches DST-only collisions while still being a
-        # small bounded calculation. Active ranges below this span are
-        # filtered by _instances_for_date.
-        recurring_span = timedelta(days=365)
-        if normalized.active_from is not None:
-            weekly_start = normalized.active_from
-        elif normalized.active_until is not None:
-            weekly_start = normalized.active_until - recurring_span
-        else:
-            weekly_start = _REFERENCE_MONDAY
-        if normalized.active_until is not None:
-            latest_start = normalized.active_until - recurring_span
-            weekly_start = min(weekly_start, latest_start)
-        weekly_end = weekly_start + recurring_span
-        intervals.append((weekly_start - padding, weekly_end + padding))
+        # Use the same stable projection as cron generation, plus neighboring
+        # days for prime times that cross midnight.
+        projection_start, projection_end = _recurring_projection_dates(normalized)
+        intervals.append((projection_start - padding, projection_end + padding))
 
     for work_date in normalized.dates:
         intervals.append((work_date - padding, work_date + padding))
@@ -639,11 +695,11 @@ def find_collisions(plan: dict) -> tuple[PrimeCollision, ...]:
 
     ordered = sorted(
         instances.values(),
-        key=lambda instance: instance.primer.astimezone(timezone.utc),
+        key=lambda instance: _utc_instant(instance.primer),
     )
     prime_groups: list[tuple[datetime, list[ScheduledSlot]]] = []
     for instance in ordered:
-        instant = instance.primer.astimezone(timezone.utc)
+        instant = _utc_instant(instance.primer)
         if prime_groups and prime_groups[-1][0] == instant:
             prime_groups[-1][1].append(instance)
         else:
@@ -708,7 +764,7 @@ def find_dispatch_collisions(
     _require_slots(normalized)
 
     local_dispatch = _local_now(dispatch_time, normalized.zone)
-    dispatch_instant = local_dispatch.astimezone(timezone.utc)
+    dispatch_instant = _utc_instant(local_dispatch)
     window_seconds = normalized.window_duration.total_seconds()
     padding_days = max(2, ceil((2 * window_seconds) / 86400) + 1)
     start = local_dispatch.date() - timedelta(days=padding_days)
@@ -717,7 +773,7 @@ def find_dispatch_collisions(
     current = start
     while current <= end:
         for instance in _instances_for_date(normalized, current):
-            instant = instance.primer.astimezone(timezone.utc)
+            instant = _utc_instant(instance.primer)
             gap_seconds = (instant - dispatch_instant).total_seconds()
             if 0 < gap_seconds < window_seconds:
                 future.setdefault(instant, instance)
@@ -745,6 +801,7 @@ def due_slots(
         return ()
     _require_slots(normalized)
     local_now = _local_now(now, normalized.zone)
+    local_now_utc = _utc_instant(local_now)
     layout = _cron_layout(normalized) if wakeup_schedule else None
     span = max(2, ceil((normalized.window_duration + TOLERANCE_AFTER).total_seconds() / 86400) + 1)
     results: list[tuple[ScheduledSlot, datetime]] = []
@@ -756,7 +813,12 @@ def due_slots(
             if key in seen:
                 continue
             candidate = instance.primer
-            if not candidate - TOLERANCE_BEFORE <= local_now <= candidate + TOLERANCE_AFTER:
+            candidate_utc = _utc_instant(candidate)
+            if not (
+                candidate_utc - TOLERANCE_BEFORE
+                <= local_now_utc
+                <= candidate_utc + TOLERANCE_AFTER
+            ):
                 continue
             if layout is not None and _wakeup_for_instance(layout, instance) != wakeup_schedule:
                 continue

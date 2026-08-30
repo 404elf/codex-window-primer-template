@@ -28,7 +28,7 @@ prime_time(slot) = work_start(slot) - (window_duration - reset_after_start(slot)
 
 ### v2 多时段计划
 
-schedule.json 是唯一业务 source of truth。weekly 的键为 0=周一 到 6=周日，每天可以有任意多个 HH:MM slot；slot 对象还可以单独覆盖 reset 延迟。dates 的规则优先于 weekly：override 替换当天 slot，extra 追加 slot，cancel 可取消指定时间或整天。prime 跨午夜时，cron 使用前一天的本地日期唤醒。
+schedule.json 是唯一业务 source of truth。weekly 的键为 0=周一 到 6=周日，每天可以有任意多个 HH:MM slot；slot 对象还可以单独覆盖 reset 延迟。dates 的规则优先于 weekly：override 替换当天 slot，extra 追加 slot，cancel 可取消指定时间或整天。prime 跨午夜时，cron 使用前一天的本地日期唤醒。启用且包含 recurring weekly slot 的 v2 计划必须有 `active_from_local`；Codex 创建新 recurring 计划时会自动使用计划时区的当前本地日期。公开 disabled 模板可以保持为 `null`，cron projection 和 collision 检查使用从该日期开始的同一段有限范围。
 
 旧版 v1 的 mode、work_start_local 和 skip_dates_local 仍可直接读取，不需要用户手工迁移。
 
@@ -53,7 +53,7 @@ schedule.json 是唯一业务 source of truth。weekly 的键为 0=周一 到 6=
 - “暂停 / 恢复” → 禁用/恢复现有计划
 - “看看现在安排了什么” → 查看有效 slot 并验证远端 workflow
 
-如果用户明确说今天临时开工或马上开工，Codex 会比较本地 prime 与当前时间：prime 未到则使用正常 cron；prime 已过且用户仍要今天工作，则保留日期计划、不生成过期日期 cron，并通过现有 workflow_dispatch 做一次 best-effort prime，同时说明原定 reset 目标已无法满足。只有当前没有活动中的 5 小时 window 时，新的 window 才会从此次请求开始；如果已有活动中的 window，请求不会重置它，因此原 reset 目标无法保证。不会新增 CLI、服务器或轮询。
+如果用户明确说临时或指定日期开工，Codex 会用 `targeted_prime_action(plan, now, target_date=..., targeted_slots=...)` 比较目标 slot 的实际 prime 与当前时间，而不是只看 work date 是否是今天。跨午夜时，目标 work date 和 prime date 可能不同：例如明天 02:00 的 prime 可能在今天晚上。prime 未到且至少提前 10 分钟时使用正常 dated cron；prime 已过或距离当前不足 10 分钟时，保留日期计划、不生成临近/过期日期 cron，并通过现有 `workflow_dispatch` 做一次 best-effort prime，同时说明原定 reset 目标已无法满足。多个目标只 dispatch 一次，未来目标仍保留 cron；cancel 不会 dispatch。只有当前没有活动中的 5 小时 window 时，新的 window 才会从此次请求开始；如果已有活动中的 window，请求不会重置它，因此原 reset 目标无法保证。`today_prime_action(...)` 仅作为目标 work date 是当前本地日期时的兼容包装。不会新增 CLI、服务器或轮询。
 
 保存或修改计划前，Codex 会运行纯调度冲突检查 `find_collisions(plan)`。如果两个不同的 prime instant 间隔小于一个 window，必须说明两个 slot、当地 prime 时间和间隔，并询问保留哪个目标，或明确标记为 best-effort；完全相同的 prime instant 共享一个 window，不算 collision。若 missed prime 需要立即 dispatch，还要用 `find_dispatch_collisions(plan, dispatch_time)` 检查 dispatch 后一个 window 内的所有未来 prime，并让用户选择优先立即 best-effort 还是保留未来 reset target。每天 09:00 和 20:00 的默认计划不构成冲突。
 
@@ -109,7 +109,7 @@ can contain any number of slots on each weekday and dated rules such as:
   "timezone": "Asia/Shanghai",
   "window_duration_minutes": 300,
   "reset_after_start_minutes": 90,
-  "active_from_local": null,
+  "active_from_local": "2030-01-01",
   "active_until_local": null,
   "weekly": {
     "0": ["09:00", "20:00"],
@@ -138,6 +138,12 @@ The date rules take precedence over recurring rules, so “today temporarily
 starts at 14:00” is represented as a dated rule. A prime time crossing
 midnight belongs to the previous local calendar date and is scheduled that
 way.
+
+An enabled v2 plan with recurring weekly slots must provide
+`active_from_local`; when Codex creates a new recurring plan, it sets this to
+the current local date in the plan timezone. The disabled public template may
+keep it `null`. Cron projection and collision checks use the same bounded range
+anchored at that date, so recurring DST changes are included without polling.
 
 The older v1 fields (`mode`, `work_start_local`, and `skip_dates_local`) are
 still accepted and normalized to the equivalent v2 plan. No credential or
@@ -190,18 +196,23 @@ requested local time across DST changes.
 
 “也开工” is also additive: it keeps the existing slots and adds the new one.
 
-### A same-day request after its prime time
+### A dated request near or after its prime time
 
-For an explicit “today temporary start” or “start as soon as possible” request,
-Codex compares the local prime with the current local time. If the prime is
-still ahead, it saves the dated rule and uses the normal cron path. If the
-prime has passed and the wording clearly means that work should still happen
-today, Codex keeps the dated plan, omits the expired date cron, and invokes the
-existing `workflow_dispatch` once as a best-effort prime. It reports that the
-original reset target can no longer be met. A new five-hour window starts with
-this request only when no five-hour window is currently active; an active
+For an explicit temporary or dated request, Codex uses
+`targeted_prime_action(plan, now, target_date=..., targeted_slots=...)` to
+compare each target's actual prime instant with the current instant. The work
+date and prime date can differ when a slot crosses midnight; a tomorrow 02:00
+slot may prime this evening. A prime at least ten minutes ahead keeps the
+normal dated cron path. A passed or near-term prime is omitted from the dated
+cron and causes one existing `workflow_dispatch` best-effort prime instead.
+With multiple targets, the missed target dispatches once while future targets
+keep their cron entries; canceled targets never dispatch. Codex reports that
+the original reset target can no longer be met. A new five-hour window starts
+with this request only when no five-hour window is currently active; an active
 window is not reset by the request, so the original reset target is not
-guaranteed. No extra workflow, CLI, server, or polling loop is introduced.
+guaranteed. `today_prime_action(...)` remains only as the compatibility
+wrapper for a target whose work date is today in the plan timezone. No extra
+workflow, CLI, server, or polling loop is introduced.
 
 Before saving a changed plan, Codex runs `find_collisions(plan)`. Any adjacent
 distinct prime instants less than one window apart must be reported with their

@@ -4,6 +4,7 @@ import unittest
 from datetime import date, datetime, time, timedelta, timezone, tzinfo
 from pathlib import Path
 from unittest.mock import patch
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from schedule_logic import (
     INERT_CRON,
@@ -14,6 +15,7 @@ from schedule_logic import (
     find_collisions,
     find_dispatch_collisions,
     prime_time,
+    targeted_prime_action,
     today_prime_action,
     validate_plan,
 )
@@ -63,6 +65,11 @@ class NewYorkTestZone(tzinfo):
 
 
 NEW_YORK = NewYorkTestZone()
+
+try:
+    CASABLANCA = ZoneInfo("Africa/Casablanca")
+except ZoneInfoNotFoundError:
+    CASABLANCA = None
 
 
 def plan(**overrides):
@@ -325,6 +332,14 @@ class ScheduleTests(unittest.TestCase):
         self.assertEqual(today_prime_action(value, now), "dispatch")
         self.assertEqual(cron_entries(value, now=now), (INERT_CRON,))
 
+    def test_today_prime_within_ten_minutes_uses_dispatch_path(self):
+        value = v2_plan(
+            dates={"2030-01-07": {"mode": "override", "slots": ["14:00"]}},
+        )
+        now = datetime(2030, 1, 7, 10, 25, tzinfo=BEIJING)
+        self.assertEqual(today_prime_action(value, now), "dispatch")
+        self.assertEqual(cron_entries(value, now=now), (INERT_CRON,))
+
     def test_today_missed_extra_is_not_hidden_by_future_recurring_slot(self):
         value = v2_plan(
             weekly={"0": ["09:00", "20:00"]},
@@ -372,6 +387,81 @@ class ScheduleTests(unittest.TestCase):
         now = datetime(2030, 1, 7, 11, 0, tzinfo=BEIJING)
         self.assertEqual(today_prime_action(value, now, ["14:00"]), "dispatch")
         self.assertEqual(today_prime_action(value, now, ["22:00"]), "schedule")
+
+    def test_future_dated_cross_midnight_near_term_prime_dispatches(self):
+        value = v2_plan(
+            dates={"2030-01-08": {"mode": "extra", "slots": ["02:00"]}},
+        )
+        now = datetime(2030, 1, 7, 22, 25, tzinfo=BEIJING)
+        self.assertEqual(
+            targeted_prime_action(value, now, target_date="2030-01-08"),
+            "dispatch",
+        )
+        self.assertEqual(cron_entries(value, now=now), (INERT_CRON,))
+
+    def test_future_dated_cross_midnight_expired_prime_dispatches(self):
+        value = v2_plan(
+            dates={"2030-01-08": {"mode": "extra", "slots": ["02:00"]}},
+        )
+        now = datetime(2030, 1, 7, 23, 0, tzinfo=BEIJING)
+        self.assertEqual(
+            targeted_prime_action(value, now, target_date=date(2030, 1, 8)),
+            "dispatch",
+        )
+        self.assertEqual(cron_entries(value, now=now), (INERT_CRON,))
+
+    def test_future_dated_cross_midnight_prime_keeps_normal_cron(self):
+        value = v2_plan(
+            dates={"2030-01-08": {"mode": "extra", "slots": ["02:00"]}},
+        )
+        now = datetime(2030, 1, 7, 20, 0, tzinfo=BEIJING)
+        self.assertEqual(
+            targeted_prime_action(value, now, target_date="2030-01-08"),
+            "schedule",
+        )
+        self.assertEqual(cron_entries(value, now=now), ("30 22 7 1 *",))
+
+    def test_cross_midnight_targets_dispatch_once_and_keep_future_prime_cron(self):
+        value = v2_plan(
+            dates={
+                "2030-01-08": {
+                    "mode": "extra",
+                    "slots": ["02:00", "12:00"],
+                }
+            },
+        )
+        now = datetime(2030, 1, 7, 22, 25, tzinfo=BEIJING)
+        self.assertEqual(
+            targeted_prime_action(
+                value,
+                now,
+                target_date="2030-01-08",
+                targeted_slots=["02:00", "12:00"],
+            ),
+            "dispatch",
+        )
+        self.assertEqual(cron_entries(value, now=now), ("30 8 8 1 *",))
+
+    def test_cross_midnight_target_uses_utc_now_instant(self):
+        value = v2_plan(
+            dates={"2030-01-08": {"mode": "extra", "slots": ["02:00"]}},
+        )
+        utc_now = datetime(2030, 1, 7, 14, 25, tzinfo=timezone.utc)
+        self.assertEqual(
+            targeted_prime_action(value, utc_now, target_date="2030-01-08"),
+            "dispatch",
+        )
+
+    def test_future_dated_cancel_does_not_dispatch_cross_midnight_target(self):
+        value = v2_plan(
+            weekly={"1": ["02:00"]},
+            dates={"2030-01-08": {"mode": "cancel"}},
+        )
+        now = datetime(2030, 1, 7, 22, 25, tzinfo=BEIJING)
+        self.assertEqual(
+            targeted_prime_action(value, now, target_date="2030-01-08"),
+            "none",
+        )
 
     def test_immediate_dispatch_reports_future_prime_inside_new_window(self):
         value = v2_plan(
@@ -480,6 +570,24 @@ class ScheduleTests(unittest.TestCase):
             ("30 5 * * 1,3", "0 17 * * 1"),
         )
 
+    def test_enabled_recurring_v2_requires_active_from(self):
+        value = v2_plan(
+            active_from_local=None,
+            weekly={"0": ["09:00"]},
+        )
+        with self.assertRaisesRegex(ValueError, "requires active_from_local"):
+            cron_entries(value)
+        with self.assertRaisesRegex(ValueError, "requires active_from_local"):
+            find_collisions(value)
+
+    def test_disabled_recurring_template_may_omit_active_from(self):
+        value = v2_plan(
+            enabled=False,
+            active_from_local=None,
+            weekly={"0": ["09:00"]},
+        )
+        self.assertEqual(cron_entries(value), (INERT_CRON,))
+
     def test_v2_new_york_dst_keeps_local_prime_time(self):
         value = v2_plan(
             timezone="America/New_York",
@@ -570,6 +678,48 @@ class ScheduleTests(unittest.TestCase):
         self.assertEqual(instance.primer.isoformat(), "2030-11-03T01:30:00-05:00")
         self.assertEqual(instance.primer.fold, 1)
 
+    def test_fall_back_due_comparison_uses_utc_instants(self):
+        value = v2_plan(
+            timezone="America/New_York",
+            active_from_local="2030-11-03",
+            active_until_local="2030-11-03",
+            dates={"2030-11-03": {"mode": "override", "slots": ["05:00"]}},
+        )
+        first_0130 = datetime(2030, 11, 3, 1, 30, tzinfo=NEW_YORK, fold=0)
+        second_0130 = datetime(2030, 11, 3, 1, 30, tzinfo=NEW_YORK, fold=1)
+        with patch("schedule_logic._timezone", return_value=NEW_YORK):
+            self.assertEqual(due_slots(value, first_0130), ())
+            self.assertEqual(len(due_slots(value, second_0130)), 1)
+
+    def test_fall_back_today_action_and_dated_filter_use_utc_instants(self):
+        value = v2_plan(
+            timezone="America/New_York",
+            active_from_local="2030-11-03",
+            active_until_local="2030-11-03",
+            dates={"2030-11-03": {"mode": "override", "slots": ["05:00"]}},
+        )
+        first_0130 = datetime(2030, 11, 3, 1, 30, tzinfo=NEW_YORK, fold=0)
+        second_0130 = datetime(2030, 11, 3, 1, 30, tzinfo=NEW_YORK, fold=1)
+        after_second = datetime(2030, 11, 3, 1, 31, tzinfo=NEW_YORK, fold=1)
+        with patch("schedule_logic._timezone", return_value=NEW_YORK):
+            self.assertEqual(today_prime_action(value, first_0130), "schedule")
+            self.assertEqual(today_prime_action(value, second_0130), "dispatch")
+            self.assertIn("30 1 3 11 *", cron_entries(value, now=first_0130))
+            self.assertEqual(cron_entries(value, now=after_second), (INERT_CRON,))
+
+    def test_spring_forward_tolerance_after_uses_elapsed_time(self):
+        value = v2_plan(
+            timezone="America/New_York",
+            active_from_local="2030-03-10",
+            active_until_local="2030-03-10",
+            dates={"2030-03-10": {"mode": "override", "slots": ["05:00"]}},
+        )
+        within_elapsed_window = datetime(2030, 3, 10, 3, 0, tzinfo=NEW_YORK)
+        outside_elapsed_window = datetime(2030, 3, 10, 4, 0, tzinfo=NEW_YORK)
+        with patch("schedule_logic._timezone", return_value=NEW_YORK):
+            self.assertEqual(len(due_slots(value, within_elapsed_window)), 1)
+            self.assertEqual(due_slots(value, outside_elapsed_window), ())
+
     def test_nonexistent_local_work_time_is_rejected(self):
         value = v2_plan(
             timezone="America/New_York",
@@ -633,6 +783,35 @@ class ScheduleTests(unittest.TestCase):
         # The corrected primes are 00:30 EST and 07:00 EDT: 5h30 elapsed,
         # so the old 01:30-based collision must not be reported.
         self.assertEqual(collisions, ())
+
+    @unittest.skipUnless(CASABLANCA is not None, "system IANA tzdata unavailable")
+    def test_modern_casablanca_iana_projection_includes_transition_prime_clock(self):
+        zone = CASABLANCA
+        current = date(2025, 1, 1)
+        end = date(2025, 12, 31)
+        prime_clocks = set()
+        while current <= end:
+            if current.weekday() == 6:
+                work_start = datetime.combine(current, time(5), tzinfo=zone)
+                prime = (
+                    work_start.astimezone(timezone.utc) - timedelta(hours=3, minutes=30)
+                ).astimezone(zone)
+                prime_clocks.add((prime.hour, prime.minute))
+            current += timedelta(days=1)
+
+        self.assertGreaterEqual(len(prime_clocks), 2)
+        value = v2_plan(
+            timezone="Africa/Casablanca",
+            active_from_local="2025-01-01",
+            active_until_local="2025-12-31",
+            weekly={"6": ["05:00"]},
+        )
+        entries = cron_entries(value)
+        entry_clocks = {
+            (int(parts[1]), int(parts[0]))
+            for parts in (entry.split() for entry in entries)
+        }
+        self.assertTrue(prime_clocks.issubset(entry_clocks))
 
     def test_v2_multiple_wakeups_do_not_duplicate_same_slot(self):
         value = v2_plan(
