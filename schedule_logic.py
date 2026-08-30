@@ -2,7 +2,8 @@
 
 The JSON plan is the business source of truth.  This module contains no
 GitHub, filesystem, or credential behavior; it only normalizes v1/v2 plans,
-calculates prime times, generates GitHub cron wake-ups, and gates due slots.
+calculates prime times, detects window collisions, generates GitHub cron
+wake-ups, and gates due slots.
 """
 
 from __future__ import annotations
@@ -59,11 +60,17 @@ class ScheduledSlot:
 
     @property
     def work_start(self) -> datetime:
-        return datetime.combine(self.work_date, self.spec.clock, tzinfo=self.zone)
+        return _resolve_local_wall_datetime(
+            datetime.combine(self.work_date, self.spec.clock),
+            self.zone,
+        )
 
     @property
     def primer(self) -> datetime:
-        return self.work_start - (self.window_duration - self.spec.reset_after_start)
+        lead = self.window_duration - self.spec.reset_after_start
+        return (
+            self.work_start.astimezone(timezone.utc) - lead
+        ).astimezone(self.zone)
 
 
 @dataclass(frozen=True)
@@ -71,6 +78,15 @@ class PrimeCollision:
     """Two effective prime requests that cannot start independent windows."""
 
     earlier: ScheduledSlot
+    later: ScheduledSlot
+    gap_minutes: float
+
+
+@dataclass(frozen=True)
+class DispatchCollision:
+    """A future prime that falls inside a same-day immediate dispatch window."""
+
+    dispatch_time: datetime
     later: ScheduledSlot
     gap_minutes: float
 
@@ -106,10 +122,35 @@ def _timezone(name: str) -> tzinfo:
         raise ValueError("unknown timezone")
 
 
+def _resolve_local_wall_datetime(value: datetime, zone: tzinfo) -> datetime:
+    """Resolve a local wall time, rejecting gaps and choosing the earlier fold."""
+
+    naive = value.replace(tzinfo=None)
+    candidates: list[datetime] = []
+    for fold in (0, 1):
+        candidate = naive.replace(tzinfo=zone, fold=fold)
+        round_trip = (
+            candidate.astimezone(timezone.utc)
+            .astimezone(zone)
+            .replace(tzinfo=None)
+        )
+        if round_trip == naive:
+            candidates.append(candidate)
+    if not candidates:
+        raise ValueError("nonexistent local work time")
+    # An ambiguous wall time has two valid instants. Pick the earlier one
+    # explicitly; a caller that needs the later fold must use an explicit
+    # offset in the v1 work_start_local value.
+    return min(candidates, key=lambda candidate: candidate.astimezone(timezone.utc))
+
+
 def _local_datetime(value: str, zone: tzinfo) -> datetime:
     parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     if parsed.tzinfo is None:
-        return parsed.replace(tzinfo=zone)
+        return _resolve_local_wall_datetime(parsed, zone)
+    # Validate the supplied local wall clock even when the input includes an
+    # offset; this rejects a spring-forward gap instead of silently shifting it.
+    _resolve_local_wall_datetime(parsed.replace(tzinfo=None), zone)
     return parsed.astimezone(zone)
 
 
@@ -378,15 +419,36 @@ def _github_weekday(work_date: date) -> int:
     return (work_date.weekday() + 1) % 7
 
 
+def _recurring_projection_dates(normalized: NormalizedPlan) -> tuple[date, date]:
+    """Choose a bounded recurring sample that includes possible DST changes."""
+
+    span = timedelta(days=365)
+    if normalized.active_from is not None:
+        start = normalized.active_from
+    elif normalized.active_until is not None:
+        start = normalized.active_until - span
+    else:
+        start = _REFERENCE_MONDAY
+    if normalized.active_until is not None:
+        start = min(start, normalized.active_until - span)
+        end = min(start + span, normalized.active_until)
+    else:
+        end = start + span
+    return start, end
+
+
 def _cron_layout(normalized: NormalizedPlan, now: datetime | None = None) -> _CronLayout:
     local_now = _local_now(now, normalized.zone) if now is not None else None
     recurring_by_time: dict[tuple[int, int], set[int]] = defaultdict(set)
-    for weekday, specs in enumerate(normalized.weekly):
-        reference_date = _REFERENCE_MONDAY + timedelta(days=weekday)
-        for spec in specs:
-            instance = ScheduledSlot(reference_date, spec, normalized.zone, normalized.window_duration)
-            primer = instance.primer
-            recurring_by_time[(primer.hour, primer.minute)].add(_github_weekday(primer.date()))
+    projection_start, projection_end = _recurring_projection_dates(normalized)
+    current = projection_start
+    while current <= projection_end:
+        if _active(normalized, current):
+            for spec in normalized.weekly[current.weekday()]:
+                instance = ScheduledSlot(current, spec, normalized.zone, normalized.window_duration)
+                primer = instance.primer
+                recurring_by_time[(primer.hour, primer.minute)].add(_github_weekday(primer.date()))
+        current += timedelta(days=1)
 
     recurring: dict[tuple[int, int, int], str] = {}
     entries: list[str] = []
@@ -579,13 +641,26 @@ def find_collisions(plan: dict) -> tuple[PrimeCollision, ...]:
         instances.values(),
         key=lambda instance: instance.primer.astimezone(timezone.utc),
     )
+    prime_groups: list[tuple[datetime, list[ScheduledSlot]]] = []
+    for instance in ordered:
+        instant = instance.primer.astimezone(timezone.utc)
+        if prime_groups and prime_groups[-1][0] == instant:
+            prime_groups[-1][1].append(instance)
+        else:
+            prime_groups.append((instant, [instance]))
+
     window_seconds = normalized.window_duration.total_seconds()
     collisions: list[PrimeCollision] = []
     seen_signatures: set[tuple[object, ...]] = set()
-    for earlier, later in zip(ordered, ordered[1:]):
+    for (earlier_instant, earlier_group), (later_instant, later_group) in zip(
+        prime_groups,
+        prime_groups[1:],
+    ):
+        earlier = earlier_group[0]
+        later = later_group[0]
         gap_seconds = (
-            later.primer.astimezone(timezone.utc)
-            - earlier.primer.astimezone(timezone.utc)
+            later_instant
+            - earlier_instant
         ).total_seconds()
         if gap_seconds < window_seconds:
             if earlier.work_date in normalized.dates or later.work_date in normalized.dates:
@@ -613,6 +688,49 @@ def find_collisions(plan: dict) -> tuple[PrimeCollision, ...]:
             seen_signatures.add(signature)
             collisions.append(PrimeCollision(earlier, later, gap_seconds / 60))
     return tuple(collisions)
+
+
+def find_dispatch_collisions(
+    plan: dict,
+    dispatch_time: datetime,
+) -> tuple[DispatchCollision, ...]:
+    """Find future primes that an immediate best-effort dispatch would cover.
+
+    ``dispatch_time`` is a temporary prime only for this decision; it is not
+    persisted in the schedule. Future effective prime instants strictly less
+    than one window after it are returned. Exact duplicate future instants are
+    grouped because they share one window.
+    """
+
+    normalized = _normalize(plan)
+    if not normalized.enabled:
+        return ()
+    _require_slots(normalized)
+
+    local_dispatch = _local_now(dispatch_time, normalized.zone)
+    dispatch_instant = local_dispatch.astimezone(timezone.utc)
+    window_seconds = normalized.window_duration.total_seconds()
+    padding_days = max(2, ceil((2 * window_seconds) / 86400) + 1)
+    start = local_dispatch.date() - timedelta(days=padding_days)
+    end = local_dispatch.date() + timedelta(days=padding_days)
+    future: dict[datetime, ScheduledSlot] = {}
+    current = start
+    while current <= end:
+        for instance in _instances_for_date(normalized, current):
+            instant = instance.primer.astimezone(timezone.utc)
+            gap_seconds = (instant - dispatch_instant).total_seconds()
+            if 0 < gap_seconds < window_seconds:
+                future.setdefault(instant, instance)
+        current += timedelta(days=1)
+
+    return tuple(
+        DispatchCollision(
+            local_dispatch,
+            instance,
+            (instant - dispatch_instant).total_seconds() / 60,
+        )
+        for instant, instance in sorted(future.items())
+    )
 
 
 def due_slots(

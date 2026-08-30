@@ -12,6 +12,7 @@ from schedule_logic import (
     due_slots,
     due_window,
     find_collisions,
+    find_dispatch_collisions,
     prime_time,
     today_prime_action,
     validate_plan,
@@ -32,8 +33,24 @@ class NewYorkTestZone(tzinfo):
         if local_date == date(2030, 3, 10):
             return local_value.time() >= time(3, 0)
         if local_date == date(2030, 11, 3):
-            return local_value.time() < time(2, 0)
+            if local_value.time() < time(1, 0):
+                return True
+            if local_value.time() < time(2, 0):
+                return value.fold == 0
+            return False
         return date(2030, 3, 10) < local_date < date(2030, 11, 3)
+
+    def fromutc(self, value):
+        utc_value = value.replace(tzinfo=None)
+        spring = datetime(2030, 3, 10, 7, 0)
+        fall = datetime(2030, 11, 3, 6, 0)
+        if spring <= utc_value < fall:
+            offset = timedelta(hours=-4)
+            fold = 0
+        else:
+            offset = timedelta(hours=-5)
+            fold = 1 if utc_value >= fall else 0
+        return (utc_value + offset).replace(tzinfo=self, fold=fold)
 
     def utcoffset(self, value):
         return timedelta(hours=-4 if self._is_dst(value) else -5)
@@ -356,6 +373,28 @@ class ScheduleTests(unittest.TestCase):
         self.assertEqual(today_prime_action(value, now, ["14:00"]), "dispatch")
         self.assertEqual(today_prime_action(value, now, ["22:00"]), "schedule")
 
+    def test_immediate_dispatch_reports_future_prime_inside_new_window(self):
+        value = v2_plan(
+            weekly={"0": ["09:00", "20:00"]},
+            dates={"2030-01-07": {"mode": "extra", "slots": ["14:00"]}},
+        )
+        dispatch_time = datetime(2030, 1, 7, 13, 0, tzinfo=BEIJING)
+        collisions = find_dispatch_collisions(value, dispatch_time)
+        self.assertEqual(len(collisions), 1)
+        self.assertEqual(collisions[0].later.spec.clock, time(20, 0))
+        self.assertEqual(round(collisions[0].gap_minutes), 210)
+
+    def test_exactly_equal_prime_instants_share_one_window(self):
+        value = v2_plan(
+            weekly={
+                "0": [
+                    "09:00",
+                    {"time": "10:00", "reset_after_start_minutes": 30},
+                ]
+            },
+        )
+        self.assertEqual(find_collisions(value), ())
+
     def test_v2_date_cancel_day(self):
         value = v2_plan(
             weekly={"0": ["09:00"]},
@@ -491,7 +530,98 @@ class ScheduleTests(unittest.TestCase):
         )
         self.assertEqual(find_collisions(value), ())
 
-    def test_dst_collision_uses_elapsed_timeline(self):
+    def test_spring_forward_prime_uses_elapsed_timeline(self):
+        value = v2_plan(
+            timezone="America/New_York",
+            active_from_local="2030-03-10",
+            active_until_local="2030-03-10",
+            weekly={"6": ["05:00"]},
+        )
+        with patch("schedule_logic._timezone", return_value=NEW_YORK):
+            due = due_slots(
+                value,
+                datetime(2030, 3, 10, 0, 30, tzinfo=NEW_YORK),
+            )
+        self.assertEqual(len(due), 1)
+        instance = due[0][0]
+        self.assertEqual(instance.work_start.isoformat(), "2030-03-10T05:00:00-04:00")
+        self.assertEqual(instance.primer.isoformat(), "2030-03-10T00:30:00-05:00")
+        self.assertEqual(
+            instance.work_start.astimezone(timezone.utc)
+            - instance.primer.astimezone(timezone.utc),
+            timedelta(hours=3, minutes=30),
+        )
+
+    def test_fall_back_prime_uses_elapsed_timeline_and_earlier_fold_policy(self):
+        value = v2_plan(
+            timezone="America/New_York",
+            active_from_local="2030-11-03",
+            active_until_local="2030-11-03",
+            weekly={"6": ["05:00"]},
+        )
+        with patch("schedule_logic._timezone", return_value=NEW_YORK):
+            due = due_slots(
+                value,
+                datetime(2030, 11, 3, 1, 30, tzinfo=NEW_YORK, fold=1),
+            )
+        self.assertEqual(len(due), 1)
+        instance = due[0][0]
+        self.assertEqual(instance.work_start.isoformat(), "2030-11-03T05:00:00-05:00")
+        self.assertEqual(instance.primer.isoformat(), "2030-11-03T01:30:00-05:00")
+        self.assertEqual(instance.primer.fold, 1)
+
+    def test_nonexistent_local_work_time_is_rejected(self):
+        value = v2_plan(
+            timezone="America/New_York",
+            active_from_local="2030-03-10",
+            active_until_local="2030-03-10",
+            weekly={"6": ["02:30"]},
+        )
+        with patch("schedule_logic._timezone", return_value=NEW_YORK):
+            with self.assertRaisesRegex(ValueError, "nonexistent local work time"):
+                cron_entries(value)
+
+    def test_ambiguous_local_work_time_uses_earlier_fold(self):
+        value = v2_plan(
+            timezone="America/New_York",
+            active_from_local="2030-11-03",
+            active_until_local="2030-11-03",
+            weekly={"6": ["01:30"]},
+        )
+        with patch("schedule_logic._timezone", return_value=NEW_YORK):
+            due = due_slots(
+                value,
+                datetime(2030, 11, 2, 22, 0, tzinfo=NEW_YORK),
+            )
+        self.assertEqual(len(due), 1)
+        self.assertEqual(due[0][0].work_start.isoformat(), "2030-11-03T01:30:00-04:00")
+        self.assertEqual(due[0][0].work_start.fold, 0)
+
+    def test_recurring_cron_includes_dst_transition_prime_clock(self):
+        value = v2_plan(
+            timezone="America/New_York",
+            active_from_local="2030-03-01",
+            active_until_local="2030-03-31",
+            weekly={"6": ["05:00"]},
+        )
+        with patch("schedule_logic._timezone", return_value=NEW_YORK):
+            entries = cron_entries(value)
+        self.assertIn("30 0 * * 0", entries)
+        self.assertIn("30 1 * * 0", entries)
+
+    def test_spring_forward_collision_uses_elapsed_timeline(self):
+        value = v2_plan(
+            timezone="America/New_York",
+            active_from_local="2030-03-10",
+            active_until_local="2030-03-10",
+            weekly={"6": ["05:00", "09:00"]},
+        )
+        with patch("schedule_logic._timezone", return_value=NEW_YORK):
+            collisions = find_collisions(value)
+        # Correct primes are 00:30 EST and 05:30 EDT: four elapsed hours.
+        self.assertTrue(any(round(item.gap_minutes) == 240 for item in collisions))
+
+    def test_corrected_spring_prime_can_remove_old_wall_clock_collision(self):
         value = v2_plan(
             timezone="America/New_York",
             active_from_local="2030-03-10",
@@ -500,9 +630,9 @@ class ScheduleTests(unittest.TestCase):
         )
         with patch("schedule_logic._timezone", return_value=NEW_YORK):
             collisions = find_collisions(value)
-        # Local prime clocks are 01:30 and 07:00 (5h30 wall time), but the
-        # spring-forward transition makes the actual timeline gap 4h30.
-        self.assertTrue(any(round(item.gap_minutes) == 270 for item in collisions))
+        # The corrected primes are 00:30 EST and 07:00 EDT: 5h30 elapsed,
+        # so the old 01:30-based collision must not be reported.
+        self.assertEqual(collisions, ())
 
     def test_v2_multiple_wakeups_do_not_duplicate_same_slot(self):
         value = v2_plan(

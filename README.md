@@ -55,7 +55,9 @@ schedule.json 是唯一业务 source of truth。weekly 的键为 0=周一 到 6=
 
 如果用户明确说今天临时开工或马上开工，Codex 会比较本地 prime 与当前时间：prime 未到则使用正常 cron；prime 已过且用户仍要今天工作，则保留日期计划、不生成过期日期 cron，并通过现有 workflow_dispatch 做一次 best-effort prime，同时说明原定 reset 目标已无法满足。只有当前没有活动中的 5 小时 window 时，新的 window 才会从此次请求开始；如果已有活动中的 window，请求不会重置它，因此原 reset 目标无法保证。不会新增 CLI、服务器或轮询。
 
-保存或修改计划前，Codex 会运行纯调度冲突检查 `find_collisions(plan)`。如果两个相邻 prime 的实际时间间隔小于一个 window，必须说明两个 slot、当地 prime 时间和间隔，并询问保留哪个目标，或明确标记为 best-effort；不能静默声称两个 reset 目标都能满足。每天 09:00 和 20:00 的默认计划不构成冲突。
+保存或修改计划前，Codex 会运行纯调度冲突检查 `find_collisions(plan)`。如果两个不同的 prime instant 间隔小于一个 window，必须说明两个 slot、当地 prime 时间和间隔，并询问保留哪个目标，或明确标记为 best-effort；完全相同的 prime instant 共享一个 window，不算 collision。若 missed prime 需要立即 dispatch，还要用 `find_dispatch_collisions(plan, dispatch_time)` 检查 dispatch 后一个 window 内的所有未来 prime，并让用户选择优先立即 best-effort 还是保留未来 reset target。每天 09:00 和 20:00 的默认计划不构成冲突。
+
+DST 策略：不存在的本地 work time（spring-forward gap）会拒绝计划；重复的本地 work time（fall-back fold）明确选择较早的实际 occurrence。prime 的计算和 collision 比较都按实际 UTC 时间线进行。
 
 ### 公共代码与私有状态
 
@@ -202,10 +204,19 @@ window is not reset by the request, so the original reset target is not
 guaranteed. No extra workflow, CLI, server, or polling loop is introduced.
 
 Before saving a changed plan, Codex runs `find_collisions(plan)`. Any adjacent
-prime requests less than one window apart must be reported with their local
-times and elapsed gap. Codex must ask which target to keep or explicitly mark
-the affected target as best-effort; it must not claim that both reset targets
-are independently guaranteed. The normal 09:00 and 20:00 plan has no collision.
+distinct prime instants less than one window apart must be reported with their
+local times and elapsed gap. Identical prime instants share one window and are
+not collisions. Codex must ask which target to keep or explicitly mark the
+affected target as best-effort; it must not claim that both reset targets are
+independently guaranteed. Before an immediate dispatch, it also runs
+`find_dispatch_collisions(plan, dispatch_time)` and reports every future prime
+inside that temporary window, asking whether to prioritize the immediate
+best-effort or the future reset target. The normal 09:00 and 20:00 plan has no
+collision.
+
+For DST, nonexistent local work times in a spring-forward gap are rejected;
+ambiguous fall-back work times use the earlier occurrence. Prime arithmetic and
+collision gaps use the actual UTC timeline.
 
 ## Why OAuth state is saved
 
