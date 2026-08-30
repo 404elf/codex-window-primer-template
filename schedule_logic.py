@@ -217,7 +217,10 @@ def _parse_slot_specs(values: object, default_reset: int, window_duration: timed
     result: list[SlotSpec] = []
     seen: set[time] = set()
     for value in values:
-        if isinstance(value, str):
+        if isinstance(value, SlotSpec):
+            clock = value.clock
+            reset_minutes = value.reset_after_start_minutes
+        elif isinstance(value, str):
             clock = _parse_clock(value)
             reset_minutes = default_reset
         elif isinstance(value, dict):
@@ -355,6 +358,231 @@ def _effective_specs(
             specs = [slot for slot in specs if slot.clock not in canceled]
     by_clock = {slot.clock: slot for slot in specs}
     return tuple(sorted(by_clock.values(), key=lambda slot: slot.clock))
+
+
+def _edit_slot_specs(
+    values: object,
+    default_reset: int,
+    window_duration: timedelta,
+) -> tuple[SlotSpec, ...]:
+    if isinstance(values, (str, dict, SlotSpec)):
+        values = [values]
+    return _parse_slot_specs(values, default_reset, window_duration)
+
+
+def _slot_json(slot: SlotSpec, default_reset: int) -> str | dict[str, object]:
+    clock = slot.clock.strftime("%H:%M")
+    if slot.reset_after_start_minutes == default_reset:
+        return clock
+    return {
+        "time": clock,
+        "reset_after_start_minutes": slot.reset_after_start_minutes,
+    }
+
+
+def _date_rule_json(
+    rule: DateRule,
+    default_reset: int,
+) -> dict[str, object]:
+    result: dict[str, object] = {"mode": rule.mode}
+    if rule.mode != "cancel" or rule.slots:
+        result["slots"] = [
+            _slot_json(slot, default_reset) for slot in rule.slots
+        ]
+    return result
+
+
+def _with_date_rule(
+    plan: dict,
+    work_date: date,
+    rule: DateRule | None,
+) -> dict:
+    updated = dict(plan)
+    dates = dict(plan.get("dates", {}))
+    key = work_date.isoformat()
+    if rule is None:
+        dates.pop(key, None)
+    else:
+        normalized = _normalize(plan)
+        dates[key] = _date_rule_json(
+            rule,
+            normalized.default_reset_after_start_minutes,
+        )
+    updated["dates"] = dates
+    return updated
+
+
+def apply_date_rule_edit(
+    plan: dict,
+    work_date: date | str,
+    operation: str,
+    slots: object | None = None,
+) -> dict:
+    """Apply one deterministic edit to a v2 date rule.
+
+    The current effective slots for ``work_date`` are the input state. ``add``
+    (also ``extra``/``append``) adds to that state, ``cancel`` removes the
+    requested clocks (or the whole day when no clocks are supplied), and
+    ``replace`` (also ``override``) replaces the target scope. A mixed history
+    that cannot be represented by one ``extra`` or ``cancel`` rule is stored as
+    a complete ``override`` so earlier edits cannot be lost. The input plan is
+    not mutated; the returned plan is safe to pass to the next edit.
+    """
+
+    if plan.get("version", 1) != 2:
+        raise ValueError("date-rule edits require a v2 plan")
+    normalized = _normalize(plan)
+    target_date = _parse_date(work_date, "work date") if isinstance(work_date, str) else work_date
+    if isinstance(target_date, datetime) or not isinstance(target_date, date):
+        raise ValueError("invalid work date")
+    if not isinstance(operation, str):
+        raise ValueError("invalid date-rule operation")
+    operation_name = operation.strip().lower()
+    if operation_name in {"add", "extra", "append"}:
+        operation_name = "add"
+    elif operation_name in {"replace", "override"}:
+        operation_name = "replace"
+    elif operation_name != "cancel":
+        raise ValueError("invalid date-rule operation")
+
+    current = _effective_specs(normalized, target_date)
+    current_by_clock = {slot.clock: slot for slot in current}
+    base = (
+        normalized.weekly[target_date.weekday()]
+        if _active(normalized, target_date)
+        else ()
+    )
+    base_clocks = {slot.clock for slot in base}
+    existing = normalized.dates.get(target_date)
+
+    if operation_name == "replace":
+        if slots is None:
+            raise ValueError("replace needs slots")
+        replacement = _edit_slot_specs(
+            slots,
+            normalized.default_reset_after_start_minutes,
+            normalized.window_duration,
+        )
+        if not replacement:
+            raise ValueError("replace needs at least one slot")
+        return _with_date_rule(
+            plan,
+            target_date,
+            DateRule("override", replacement),
+        )
+
+    if operation_name == "add":
+        if slots is None:
+            raise ValueError("add needs slots")
+        additions = _edit_slot_specs(
+            slots,
+            normalized.default_reset_after_start_minutes,
+            normalized.window_duration,
+        )
+        final_by_clock = dict(current_by_clock)
+        for slot in additions:
+            # Adding an already-effective clock is idempotent and preserves
+            # its established reset timing.
+            final_by_clock.setdefault(slot.clock, slot)
+        final = tuple(sorted(final_by_clock.values(), key=lambda slot: slot.clock))
+
+        if existing is None:
+            extra = tuple(slot for slot in additions if slot.clock not in base_clocks)
+            if not extra:
+                return dict(plan)
+            return _with_date_rule(plan, target_date, DateRule("extra", extra))
+        if existing.mode == "extra":
+            current_clocks = set(current_by_clock)
+            new_extra = tuple(
+                slot for slot in additions if slot.clock not in current_clocks
+            )
+            if not new_extra:
+                return dict(plan)
+            return _with_date_rule(
+                plan,
+                target_date,
+                DateRule("extra", tuple(existing.slots) + new_extra),
+            )
+        # A prior cancel and a new add, or a prior override and a new add,
+        # need the complete effective result to preserve both intentions.
+        return _with_date_rule(plan, target_date, DateRule("override", final))
+
+    # A cancel without clocks means cancel the whole date, regardless of the
+    # previous rule mode.
+    if slots is None:
+        return _with_date_rule(plan, target_date, DateRule("cancel"))
+    canceled_specs = _edit_slot_specs(
+        slots,
+        normalized.default_reset_after_start_minutes,
+        normalized.window_duration,
+    )
+    canceled_clocks = {slot.clock for slot in canceled_specs}
+    if not canceled_clocks:
+        return _with_date_rule(plan, target_date, DateRule("cancel"))
+
+    final_by_clock = {
+        clock: slot
+        for clock, slot in current_by_clock.items()
+        if clock not in canceled_clocks
+    }
+    final = tuple(sorted(final_by_clock.values(), key=lambda slot: slot.clock))
+
+    if existing is None:
+        base_canceled = tuple(
+            sorted(base_clocks & canceled_clocks)
+        )
+        if not base_canceled:
+            return dict(plan)
+        return _with_date_rule(
+            plan,
+            target_date,
+            DateRule("cancel", tuple(SlotSpec(clock, normalized.default_reset_after_start_minutes) for clock in base_canceled)),
+        )
+
+    if existing.mode == "cancel":
+        if not existing.slots:
+            return dict(plan)
+        already_canceled = {slot.clock for slot in existing.slots}
+        merged = tuple(
+            SlotSpec(clock, normalized.default_reset_after_start_minutes)
+            for clock in sorted(already_canceled | (base_clocks & canceled_clocks))
+        )
+        if not merged:
+            return dict(plan)
+        return _with_date_rule(plan, target_date, DateRule("cancel", merged))
+
+    if existing.mode == "extra":
+        remaining_extra = tuple(
+            slot for slot in existing.slots if slot.clock not in canceled_clocks
+        )
+        base_canceled = base_clocks & canceled_clocks
+        if base_canceled and remaining_extra:
+            return _with_date_rule(plan, target_date, DateRule("override", final))
+        if remaining_extra:
+            return _with_date_rule(
+                plan,
+                target_date,
+                DateRule("extra", remaining_extra),
+            )
+        if base_canceled:
+            return _with_date_rule(
+                plan,
+                target_date,
+                DateRule(
+                    "cancel",
+                    tuple(
+                        SlotSpec(clock, normalized.default_reset_after_start_minutes)
+                        for clock in sorted(base_canceled)
+                    ),
+                ),
+            )
+        return _with_date_rule(plan, target_date, None)
+
+    # A prior override has no separate base/additive representation. Keep the
+    # complete remaining effective slots, using whole-day cancel for empty.
+    if final:
+        return _with_date_rule(plan, target_date, DateRule("override", final))
+    return _with_date_rule(plan, target_date, DateRule("cancel"))
 
 
 def _instances_for_date(
@@ -560,6 +788,8 @@ def _targeted_prime_action(
     target_date: date,
     targeted_slots: object | None,
 ) -> str:
+    if not normalized.enabled:
+        return "none"
     date_rule = normalized.dates.get(target_date)
     if date_rule is not None and date_rule.mode == "cancel":
         return "none"

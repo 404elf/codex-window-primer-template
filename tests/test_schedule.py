@@ -8,6 +8,9 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from schedule_logic import (
     INERT_CRON,
+    _effective_specs,
+    _normalize,
+    apply_date_rule_edit,
     cron_entries,
     cron_for,
     due_slots,
@@ -106,6 +109,14 @@ def v2_plan(**overrides):
 
 
 class ScheduleTests(unittest.TestCase):
+    @staticmethod
+    def effective_clocks(value, work_date):
+        normalized = _normalize(value)
+        return tuple(
+            slot.clock.strftime("%H:%M")
+            for slot in _effective_specs(normalized, work_date)
+        )
+
     def test_once(self):
         value = plan()
         self.assertEqual(prime_time(value).isoformat(), "2030-01-02T06:30:00+08:00")
@@ -462,6 +473,111 @@ class ScheduleTests(unittest.TestCase):
             targeted_prime_action(value, now, target_date="2030-01-08"),
             "none",
         )
+
+    def test_date_edit_cancel_then_extra_preserves_cancel(self):
+        value = v2_plan(weekly={"0": ["09:00", "20:00"]})
+        value = apply_date_rule_edit(value, "2030-01-07", "cancel", ["09:00"])
+        value = apply_date_rule_edit(value, "2030-01-07", "add", ["14:00"])
+        self.assertEqual(
+            self.effective_clocks(value, date(2030, 1, 7)),
+            ("14:00", "20:00"),
+        )
+        self.assertEqual(value["dates"]["2030-01-07"]["mode"], "override")
+
+    def test_date_edit_extra_then_cancel_preserves_extra(self):
+        value = v2_plan(weekly={"0": ["09:00", "20:00"]})
+        value = apply_date_rule_edit(value, "2030-01-07", "add", ["14:00"])
+        value = apply_date_rule_edit(value, "2030-01-07", "cancel", ["09:00"])
+        self.assertEqual(
+            self.effective_clocks(value, date(2030, 1, 7)),
+            ("14:00", "20:00"),
+        )
+        self.assertEqual(value["dates"]["2030-01-07"]["mode"], "override")
+
+    def test_date_edit_extra_then_extra_accumulates(self):
+        value = v2_plan(weekly={"0": ["09:00", "20:00"]})
+        value = apply_date_rule_edit(value, date(2030, 1, 7), "extra", ["14:00"])
+        value = apply_date_rule_edit(value, date(2030, 1, 7), "add", ["18:00"])
+        self.assertEqual(
+            self.effective_clocks(value, date(2030, 1, 7)),
+            ("09:00", "14:00", "18:00", "20:00"),
+        )
+        self.assertEqual(value["dates"]["2030-01-07"]["mode"], "extra")
+
+    def test_date_edit_multiple_cancels_accumulate(self):
+        value = v2_plan(weekly={"0": ["09:00", "20:00"]})
+        value = apply_date_rule_edit(value, "2030-01-07", "cancel", ["09:00"])
+        value = apply_date_rule_edit(value, "2030-01-07", "cancel", ["20:00"])
+        self.assertEqual(self.effective_clocks(value, date(2030, 1, 7)), ())
+        self.assertEqual(value["dates"]["2030-01-07"]["mode"], "cancel")
+        self.assertEqual(
+            set(value["dates"]["2030-01-07"]["slots"]),
+            {"09:00", "20:00"},
+        )
+
+    def test_date_edit_override_then_extra_accumulates_in_override(self):
+        value = v2_plan(weekly={"0": ["09:00", "20:00"]})
+        value = apply_date_rule_edit(value, "2030-01-07", "override", ["14:00"])
+        value = apply_date_rule_edit(value, "2030-01-07", "extra", ["18:00"])
+        self.assertEqual(
+            self.effective_clocks(value, date(2030, 1, 7)),
+            ("14:00", "18:00"),
+        )
+        self.assertEqual(value["dates"]["2030-01-07"]["mode"], "override")
+
+    def test_date_edit_extra_then_replace_replaces_only_target_date(self):
+        value = v2_plan(
+            weekly={"0": ["09:00", "20:00"], "1": ["09:00"]},
+        )
+        value = apply_date_rule_edit(value, "2030-01-07", "extra", ["14:00"])
+        value = apply_date_rule_edit(value, "2030-01-07", "replace", ["16:00"])
+        self.assertEqual(
+            self.effective_clocks(value, date(2030, 1, 7)),
+            ("16:00",),
+        )
+        self.assertEqual(
+            self.effective_clocks(value, date(2030, 1, 8)),
+            ("09:00",),
+        )
+        self.assertEqual(value["dates"]["2030-01-07"]["mode"], "override")
+
+    def test_date_edit_cancel_day_then_add_reopens_only_added_slot(self):
+        value = v2_plan(weekly={"0": ["09:00", "20:00"]})
+        value = apply_date_rule_edit(value, "2030-01-07", "cancel")
+        value = apply_date_rule_edit(value, "2030-01-07", "add", ["14:00"])
+        self.assertEqual(self.effective_clocks(value, date(2030, 1, 7)), ("14:00",))
+        self.assertEqual(value["dates"]["2030-01-07"]["mode"], "override")
+
+    def test_sequential_date_edits_keep_cron_projection_in_sync(self):
+        value = v2_plan(weekly={"0": ["09:00", "20:00"]})
+        value = apply_date_rule_edit(value, "2030-01-07", "cancel", ["09:00"])
+        value = apply_date_rule_edit(value, "2030-01-07", "add", ["14:00"])
+        value = apply_date_rule_edit(value, "2030-01-07", "add", ["18:00"])
+        self.assertEqual(
+            self.effective_clocks(value, date(2030, 1, 7)),
+            ("14:00", "18:00", "20:00"),
+        )
+        entries = cron_entries(value)
+        self.assertIn("30 10 7 1 *", entries)
+        self.assertIn("30 14 7 1 *", entries)
+        self.assertIn("30 16 * * 1", entries)
+        self.assertNotIn("30 5 7 1 *", entries)
+
+    def test_sequential_cross_midnight_date_edits_preserve_final_slot_and_cron(self):
+        value = v2_plan(weekly={"1": ["20:00"]})
+        value = apply_date_rule_edit(value, "2030-01-08", "add", ["02:00"])
+        value = apply_date_rule_edit(value, "2030-01-08", "cancel", ["20:00"])
+        self.assertEqual(self.effective_clocks(value, date(2030, 1, 8)), ("02:00",))
+        self.assertEqual(value["dates"]["2030-01-08"]["mode"], "override")
+        self.assertIn("30 22 7 1 *", cron_entries(value))
+
+    def test_today_prime_action_disabled_plan_returns_none(self):
+        value = v2_plan(
+            enabled=False,
+            dates={"2030-01-07": {"mode": "override", "slots": ["14:00"]}},
+        )
+        now = datetime(2030, 1, 7, 11, 0, tzinfo=BEIJING)
+        self.assertEqual(today_prime_action(value, now), "none")
 
     def test_immediate_dispatch_reports_future_prime_inside_new_window(self):
         value = v2_plan(
