@@ -656,6 +656,186 @@ class ScheduleTests(unittest.TestCase):
         )
         self.assertEqual(value["dates"]["2030-01-07"]["mode"], "override")
 
+    def test_date_edit_update_weekly_slot_preserves_other_slots_and_changes_prime(self):
+        value = v2_plan(weekly={"0": ["09:00", "20:00"]})
+        value = apply_date_rule_edit(
+            value,
+            "2030-01-07",
+            "set",
+            [{"time": "09:00", "reset_after_start_minutes": 120}],
+        )
+        normalized = _normalize(value)
+        specs = _effective_specs(normalized, date(2030, 1, 7))
+        self.assertEqual(
+            [(spec.clock.strftime("%H:%M"), spec.reset_after_start_minutes) for spec in specs],
+            [("09:00", 120), ("20:00", 90)],
+        )
+        self.assertEqual(value["dates"]["2030-01-07"]["mode"], "override")
+        self.assertEqual(
+            value["dates"]["2030-01-07"]["slots"],
+            [
+                {"time": "09:00", "reset_after_start_minutes": 120},
+                "20:00",
+            ],
+        )
+        self.assertIn("0 6 7 1 *", cron_entries(value))
+        due = due_slots(
+            value,
+            datetime(2030, 1, 7, 6, 0, tzinfo=BEIJING),
+            wakeup_schedule="0 6 7 1 *",
+        )
+        self.assertEqual(len(due), 1)
+        self.assertEqual(due[0][0].spec.reset_after_start_minutes, 120)
+
+    def test_date_edit_upsert_adds_missing_slot_with_custom_reset(self):
+        value = v2_plan(weekly={"0": ["09:00", "20:00"]})
+        value = apply_date_rule_edit(
+            value,
+            "2030-01-07",
+            "upsert",
+            {"time": "14:00", "reset_after_start_minutes": 120},
+        )
+        normalized = _normalize(value)
+        specs = _effective_specs(normalized, date(2030, 1, 7))
+        self.assertEqual(
+            [(spec.clock.strftime("%H:%M"), spec.reset_after_start_minutes) for spec in specs],
+            [("09:00", 90), ("14:00", 120), ("20:00", 90)],
+        )
+        self.assertEqual(value["dates"]["2030-01-07"]["mode"], "extra")
+        self.assertEqual(
+            value["dates"]["2030-01-07"]["slots"],
+            [{"time": "14:00", "reset_after_start_minutes": 120}],
+        )
+        self.assertIn("0 11 7 1 *", cron_entries(value))
+
+    def test_date_edit_update_existing_extra_slot_changes_its_reset(self):
+        value = v2_plan(
+            weekly={"0": ["09:00"]},
+            dates={"2030-01-07": {"mode": "extra", "slots": ["14:00"]}},
+        )
+        value = apply_date_rule_edit(
+            value,
+            "2030-01-07",
+            "update",
+            {"time": "14:00", "reset_after_start_minutes": 120},
+        )
+        normalized = _normalize(value)
+        specs = _effective_specs(normalized, date(2030, 1, 7))
+        self.assertEqual(
+            [(spec.clock.strftime("%H:%M"), spec.reset_after_start_minutes) for spec in specs],
+            [("09:00", 90), ("14:00", 120)],
+        )
+        self.assertEqual(value["dates"]["2030-01-07"]["mode"], "extra")
+        self.assertEqual(
+            value["dates"]["2030-01-07"]["slots"],
+            [{"time": "14:00", "reset_after_start_minutes": 120}],
+        )
+        self.assertIn("0 11 7 1 *", cron_entries(value))
+
+    def test_date_edit_update_existing_override_slot_preserves_override_slots(self):
+        value = v2_plan(
+            weekly={"0": ["09:00", "20:00"]},
+            dates={"2030-01-07": {"mode": "override", "slots": ["09:00", "14:00"]}},
+        )
+        value = apply_date_rule_edit(
+            value,
+            "2030-01-07",
+            "update",
+            {"time": "14:00", "reset_after_start_minutes": 120},
+        )
+        normalized = _normalize(value)
+        specs = _effective_specs(normalized, date(2030, 1, 7))
+        self.assertEqual(
+            [(spec.clock.strftime("%H:%M"), spec.reset_after_start_minutes) for spec in specs],
+            [("09:00", 90), ("14:00", 120)],
+        )
+        self.assertEqual(value["dates"]["2030-01-07"]["mode"], "override")
+        self.assertIn("0 11 7 1 *", cron_entries(value))
+
+    def test_date_edit_update_same_parameters_is_idempotent(self):
+        value = v2_plan(weekly={"0": ["09:00", "20:00"]})
+        first = apply_date_rule_edit(
+            value,
+            "2030-01-07",
+            "update",
+            {"time": "09:00", "reset_after_start_minutes": 120},
+        )
+        second = apply_date_rule_edit(
+            first,
+            "2030-01-07",
+            "set",
+            {"time": "09:00", "reset_after_start_minutes": 120},
+        )
+        self.assertEqual(second, first)
+
+    def test_date_edit_update_changes_collision_detection_prime(self):
+        value = v2_plan(weekly={"0": ["09:00", "12:00"]})
+        value = apply_date_rule_edit(
+            value,
+            "2030-01-07",
+            "update",
+            {"time": "12:00", "reset_after_start_minutes": 0},
+        )
+        collisions = find_collisions(value)
+        self.assertTrue(
+            any(
+                item.later.work_date == date(2030, 1, 7)
+                and item.later.spec.clock == time(12)
+                and round(item.gap_minutes) == 90
+                for item in collisions
+            )
+        )
+
+    def test_date_edit_update_changes_targeted_prime_action(self):
+        value = v2_plan(weekly={"0": ["09:00", "20:00"]})
+        value = apply_date_rule_edit(
+            value,
+            "2030-01-07",
+            "update",
+            {"time": "09:00", "reset_after_start_minutes": 120},
+        )
+        self.assertEqual(
+            targeted_prime_action(
+                value,
+                datetime(2030, 1, 7, 5, 40, tzinfo=BEIJING),
+                target_date="2030-01-07",
+                targeted_slots=["09:00"],
+            ),
+            "schedule",
+        )
+
+    def test_date_edit_update_cross_midnight_reset_changes_cron(self):
+        value = v2_plan(weekly={"1": ["02:00"]})
+        value = apply_date_rule_edit(
+            value,
+            "2030-01-08",
+            "update",
+            {"time": "02:00", "reset_after_start_minutes": 120},
+        )
+        normalized = _normalize(value)
+        specs = _effective_specs(normalized, date(2030, 1, 8))
+        self.assertEqual(specs[0].reset_after_start_minutes, 120)
+        self.assertIn("0 23 7 1 *", cron_entries(value))
+
+    def test_date_edit_add_cancel_update_keeps_all_prior_intent(self):
+        value = v2_plan(weekly={"0": ["09:00", "20:00"]})
+        value = apply_date_rule_edit(value, "2030-01-07", "add", ["14:00"])
+        value = apply_date_rule_edit(value, "2030-01-07", "cancel", ["09:00"])
+        value = apply_date_rule_edit(
+            value,
+            "2030-01-07",
+            "update",
+            {"time": "14:00", "reset_after_start_minutes": 120},
+        )
+        normalized = _normalize(value)
+        specs = _effective_specs(normalized, date(2030, 1, 7))
+        self.assertEqual(
+            [(spec.clock.strftime("%H:%M"), spec.reset_after_start_minutes) for spec in specs],
+            [("14:00", 120), ("20:00", 90)],
+        )
+        self.assertEqual(value["dates"]["2030-01-07"]["mode"], "override")
+        self.assertIn("0 11 7 1 *", cron_entries(value))
+
     def test_date_edit_extra_then_replace_replaces_only_target_date(self):
         value = v2_plan(
             weekly={"0": ["09:00", "20:00"], "1": ["09:00"]},

@@ -428,10 +428,13 @@ def apply_date_rule_edit(
     The current effective slots for ``work_date`` are the input state. ``add``
     (also ``extra``/``append``) adds to that state, ``cancel`` removes the
     requested clocks (or the whole day when no clocks are supplied), and
-    ``replace`` (also ``override``) replaces the target scope. A mixed history
-    that cannot be represented by one ``extra`` or ``cancel`` rule is stored as
-    a complete ``override`` so earlier edits cannot be lost. The input plan is
-    not mutated; the returned plan is safe to pass to the next edit.
+    ``replace`` (also ``override``) replaces the target scope. ``set``
+    (also ``update``/``upsert``) updates the reset timing for each supplied
+    clock, or adds that clock when it is not present, while retaining every
+    other effective slot. A mixed history that cannot be represented by one
+    ``extra`` or ``cancel`` rule is stored as a complete ``override`` so
+    earlier edits cannot be lost. The input plan is not mutated; the returned
+    plan is safe to pass to the next edit.
     """
 
     if plan.get("version", 1) != 2:
@@ -447,6 +450,8 @@ def apply_date_rule_edit(
         operation_name = "add"
     elif operation_name in {"replace", "override"}:
         operation_name = "replace"
+    elif operation_name in {"set", "update", "upsert"}:
+        operation_name = "update"
     elif operation_name != "cancel":
         raise ValueError("invalid date-rule operation")
 
@@ -459,6 +464,56 @@ def apply_date_rule_edit(
     )
     base_clocks = {slot.clock for slot in base}
     existing = normalized.dates.get(target_date)
+
+    if operation_name == "update":
+        if slots is None:
+            raise ValueError("update needs slots")
+        updates = _edit_slot_specs(
+            slots,
+            normalized.default_reset_after_start_minutes,
+            normalized.window_duration,
+        )
+        if not updates:
+            raise ValueError("update needs at least one slot")
+
+        changed = any(current_by_clock.get(slot.clock) != slot for slot in updates)
+        if not changed:
+            return dict(plan)
+
+        final_by_clock = dict(current_by_clock)
+        for slot in updates:
+            final_by_clock[slot.clock] = slot
+        final = tuple(sorted(final_by_clock.values(), key=lambda slot: slot.clock))
+
+        if existing is None:
+            # An update to a weekly clock is represented as a full override so
+            # the date rule does not need duplicate-clock "extra" semantics.
+            if any(slot.clock in base_clocks for slot in updates):
+                return _with_date_rule(plan, target_date, DateRule("override", final))
+            return _with_date_rule(plan, target_date, DateRule("extra", updates))
+
+        if existing.mode == "extra":
+            existing_extra = {slot.clock: slot for slot in existing.slots}
+            updates_weekly_clock = any(
+                slot.clock in base_clocks and slot.clock not in existing_extra
+                for slot in updates
+            )
+            if updates_weekly_clock:
+                return _with_date_rule(plan, target_date, DateRule("override", final))
+            for slot in updates:
+                existing_extra[slot.clock] = slot
+            updated_extra = tuple(
+                sorted(existing_extra.values(), key=lambda slot: slot.clock)
+            )
+            return _with_date_rule(
+                plan,
+                target_date,
+                DateRule("extra", updated_extra),
+            )
+
+        # A prior override or cancel encodes date-specific intent; retain it
+        # by materializing the newly effective complete slot set.
+        return _with_date_rule(plan, target_date, DateRule("override", final))
 
     if operation_name == "replace":
         if slots is None:

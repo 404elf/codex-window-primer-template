@@ -55,6 +55,8 @@ schedule.json 是唯一业务 source of truth。weekly 的键为 0=周一 到 6=
 
 日期规则的连续修改是确定性的：每次先读取该日期当前的 effective slots，再只应用本次 add、cancel 或 replace 操作。若混合历史无法由单个 `extra` 或 `cancel` 无损表达，就把最终完整 slot 集合规范化为 `override`，确保后一次修改不会恢复或丢失之前已确认的取消/追加。
 
+“修改某个已有时段的刷新目标”是 slot 参数更新，不是整日 replace。Codex 使用 `set` / `update` / `upsert` 按 clock 更新该 slot 的 `reset_after_start_minutes`；当天其他 effective slots 保留，clock 不存在时则新增该 slot。默认 reset timing 仍写成简单的 `HH:MM`，非默认 timing 写成带 `reset_after_start_minutes` 的 slot object。
+
 如果用户明确说临时或指定日期开工，Codex 会用 `targeted_prime_action(plan, now, target_date=..., targeted_slots=...)` 比较目标 slot 的实际 prime 与当前时间，而不是只看 work date 是否是今天。跨午夜时，目标 work date 和 prime date 可能不同：例如明天 02:00 的 prime 可能在今天晚上。prime 未到且至少提前 10 分钟时使用正常 dated cron；prime 已过或距离当前不足 10 分钟时，保留日期计划、不生成临近/过期日期 cron，并通过现有 `workflow_dispatch` 做一次 best-effort prime，同时说明原定 reset 目标已无法满足。多个目标只 dispatch 一次，未来目标仍保留 cron；cancel 不会 dispatch。只有当前没有活动中的 5 小时 window 时，新的 window 才会从此次请求开始；如果已有活动中的 window，请求不会重置它，因此原 reset 目标无法保证。`today_prime_action(...)` 仅作为目标 work date 是当前本地日期时的兼容包装。不会新增 CLI、服务器或轮询。
 
 保存或修改计划前，Codex 会运行纯调度冲突检查 `find_collisions(plan)`。如果两个不同的 prime instant 间隔小于一个 window，必须说明两个 slot、当地 prime 时间和间隔，并询问保留哪个目标，或明确标记为 best-effort；完全相同的 prime instant 共享一个 window，不算 collision。若 missed prime 需要立即 dispatch，还要用 `find_dispatch_collisions(plan, dispatch_time)` 检查 dispatch 后一个 window 内的所有未来 prime，并让用户选择优先立即 best-effort 还是保留未来 reset target。每天 09:00 和 20:00 的默认计划不构成冲突。
@@ -209,6 +211,11 @@ operation, and chooses the smallest lossless rule representation. If a mixed
 history cannot be represented by one `extra` or `cancel` rule, the complete
 result is normalized to `override`, so a later edit cannot restore or discard
 an earlier confirmed cancellation or addition.
+
+Changing the reset target of one existing slot is a slot-parameter update, not
+a whole-day replace. `set` / `update` / `upsert` updates by clock, keeps the
+other effective slots, and adds the clock if it was absent. Default reset timing
+stays as a simple `HH:MM`; non-default timing is stored as a slot object.
 
 ### A dated request near or after its prime time
 
