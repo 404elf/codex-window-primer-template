@@ -1,5 +1,72 @@
 # Codex Window Primer
 
+## 中文
+
+将 Codex 的 5 小时 usage window 与用户的工作时间对齐。
+
+这是一个非官方社区项目：它只调整 5 小时窗口的开始时间，不增加 5 小时或 weekly usage quota，不绕过限额，也不破解限流。This is an unofficial community project and is not affiliated with or endorsed by OpenAI.
+
+### 工作原理
+
+```text
+用自然语言告诉 Codex 工作时间
+        ↓
+Codex 写入多时段 schedule.json
+        ↓
+私有 GitHub Actions 按生成的本地时区 cron entries 唤醒
+        ↓
+一次最小的 OAuth Codex 请求
+        ↓
+更早启动 5 小时窗口
+```
+
+默认 5 小时窗口、开工后 1 小时 30 分刷新：
+
+prime_time(slot) = work_start(slot) - (window_duration - reset_after_start(slot))
+
+例如 10:00 开工 → 06:30 prime → 约 11:30 刷新。GitHub Actions 是尽力调度，可能有延迟，不保证秒级精度。
+
+### v2 多时段计划
+
+schedule.json 是唯一业务 source of truth。weekly 的键为 0=周一 到 6=周日，每天可以有任意多个 HH:MM slot；slot 对象还可以单独覆盖 reset 延迟。dates 的规则优先于 weekly：override 替换当天 slot，extra 追加 slot，cancel 可取消指定时间或整天。prime 跨午夜时，cron 使用前一天的本地日期唤醒。
+
+旧版 v1 的 mode、work_start_local 和 skip_dates_local 仍可直接读取，不需要用户手工迁移。
+
+### 快速开始
+
+1. 使用本模板创建一个 Private runtime repository，不能把该运行仓库公开。
+2. 在可信电脑上安装 Git、Python 3.11+、官方 age、GitHub CLI 和 Codex CLI。
+3. 按 docs/bootstrap-windows.md 完成一次隔离登录、加密 OAuth 状态和 GitHub Secret 设置；不要使用 API key。
+4. 用自然语言告诉 Codex 工作安排。Codex 会更新 schedule.json 和所有标记 cron entries，并核对远端配置。
+5. 手动运行 workflow 两次，每次等待前一次结束，并检查日志没有秘密。
+
+安装完成后，用户不需要手工编辑 YAML、cron、UTC、timezone 或认证文件。
+
+### 自然语言控制
+
+- “每天 9 点和晚上 8 点” → 每天两个 slot
+- “工作日 9 点，周末 11 点” → 工作日/周末规则
+- “明天 10 点开工” → 指定日期的一次性 slot
+- “再加一个 / 也开工” → 追加已有计划，不替换
+- “改成下午 2 点” → 替换相关范围
+- “今天取消” → 只取消今天的 occurrence
+- “暂停 / 恢复” → 禁用/恢复现有计划
+- “看看现在安排了什么” → 查看有效 slot 并验证远端 workflow
+
+如果用户明确说今天临时开工或马上开工，Codex 会比较本地 prime 与当前时间：prime 未到则使用正常 cron；prime 已过且用户仍要今天工作，则保留日期计划、不生成过期日期 cron，并通过现有 workflow_dispatch 做一次 best-effort prime，同时说明原定 reset 目标已无法满足、实际窗口从 dispatch 时间开始。不会新增 CLI、服务器或轮询。
+
+### 公共代码与私有状态
+
+公开仓库只放源代码、workflow 模板、安装工具和文档。每位用户都应创建自己的私有 runtime repository。真实 auth.json、OAuth access/refresh token、账户信息、age 私钥和解密后的凭据绝不能进入公开仓库、Issue、PR、prompt 或日志。
+
+### 安全与限制
+
+workflow 只有 schedule 和 workflow_dispatch 触发器，使用单一 concurrency 防止 OAuth refresh 并发。Codex 在隔离的 CODEX_HOME 中运行，只有解密步骤接触 AGE_PRIVATE_KEY；checkout 不持久化 GitHub token，刷新后的加密状态才由最后步骤保存。
+
+GitHub schedule 只是唤醒机制，可能延迟；一次性日期 cron 可能按日/月再次唤醒，但 gate 会阻止过期日期真正执行。项目不会增加 Codex quota。
+
+## English
+
 Align your Codex five-hour usage window with your work schedule.
 
 This small community project sends one minimal Codex request before a planned work session. It changes when the rolling five-hour window starts; it does **not** increase the five-hour or weekly usage quota, bypass limits, or defeat rate limiting.
