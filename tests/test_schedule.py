@@ -1300,6 +1300,16 @@ class ScheduleTests(unittest.TestCase):
         self.assertIn("WAKEUP_SCHEDULE: ${{ github.event.schedule }}", workflow)
         self.assertIn("wakeup_schedule=os.environ.get(\"WAKEUP_SCHEDULE\") or None", workflow)
 
+    def test_workflow_dispatch_sources_are_gated_before_credentials(self):
+        root = Path(__file__).resolve().parents[1]
+        workflow = (root / ".github" / "workflows" / "codex-window-primer.yml").read_text(encoding="utf-8")
+        gate = workflow[workflow.index("- name: Decide whether this run is due"):workflow.index("- name: Install age")]
+        credential_steps = workflow[workflow.index("- name: Install age"):]
+        self.assertIn("DISPATCH_SOURCE: ${{ inputs.source }}", gate)
+        self.assertIn("dispatch_source=os.environ.get(\"DISPATCH_SOURCE\", \"\")", gate)
+        self.assertNotIn("AGE_PRIVATE_KEY", gate)
+        self.assertIn("if: steps.gate.outputs.should_run == 'true'", credential_steps)
+
     def test_oauth_and_workflow_security_invariants_remain(self):
         root = Path(__file__).resolve().parents[1]
         workflow = (root / ".github" / "workflows" / "codex-window-primer.yml").read_text(encoding="utf-8")

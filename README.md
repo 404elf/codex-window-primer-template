@@ -69,7 +69,7 @@ DST 策略：不存在的本地 work time（spring-forward gap）会拒绝计划
 
 ### 安全与限制
 
-workflow 只有 schedule 和 workflow_dispatch 触发器，使用单一 concurrency 防止 OAuth refresh 并发。Codex 在隔离的 CODEX_HOME 中运行，只有解密步骤接触 AGE_PRIVATE_KEY；checkout 不持久化 GitHub token，刷新后的加密状态才由最后步骤保存。
+workflow 只有 schedule 和 workflow_dispatch 触发器，使用单一 concurrency 防止 OAuth refresh 并发。Codex 在隔离的 CODEX_HOME 中运行，只有解密步骤接触 AGE_PRIVATE_KEY；checkout 不持久化 GitHub token，刷新后的加密状态才由最后步骤保存。可选的 Cloudflare PoC Worker 只负责外部唤醒：`source=cloudflare` 必须通过当前时间的 schedule gate，公开 HTTP 入口仅返回健康状态；`source=manual` 才保留人工测试 bypass，未知来源会安全跳过。
 
 GitHub schedule 只是唤醒机制，可能延迟；一次性日期 cron 可能按日/月再次唤醒，但 gate 会阻止过期日期真正执行。项目不会增加 Codex quota。
 
@@ -254,7 +254,7 @@ collision gaps use the actual UTC timeline.
 
 Codex OAuth may refresh or rotate credentials while a run is active. The workflow decrypts the private repository's encrypted bundle into a fresh runner-local `CODEX_HOME`, runs one request, detects a changed file, encrypts it again, and pushes only the ciphertext. This prevents the next run from receiving a stale refresh token. The plaintext file and temporary key are removed when the job exits.
 
-The workflow uses a single concurrency group so two runs cannot refresh the same OAuth state at once. It has only `schedule` and `workflow_dispatch` triggers. There are no Pull Request, Issue, push, reusable-workflow, or external-input credential paths. Multiple cron entries are wake-ups only: the gate compares the event's cron text with the effective slot, so a wake-up for another slot cannot send a duplicate request.
+The workflow uses a single concurrency group so two runs cannot refresh the same OAuth state at once. It has only `schedule` and `workflow_dispatch` triggers. There are no Pull Request, Issue, push, or reusable-workflow credential paths. Multiple cron entries are wake-ups only: the gate compares the event's cron text with the effective slot, so a wake-up for another slot cannot send a duplicate request. The optional Cloudflare PoC uses `source=cloudflare`, which must pass the current-time calendar gate before OAuth steps; `source=manual` is the explicit test bypass and unknown sources fail closed. Its public HTTP handler is health-only.
 
 The credential-bearing stages are deliberately separated. Only the decrypt
 stage receives `AGE_PRIVATE_KEY`; it derives and saves the public age

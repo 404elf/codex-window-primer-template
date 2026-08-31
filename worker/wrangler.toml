@@ -1,0 +1,6 @@
+name = "codex-window-primer-scheduler"
+main = "src/index.js"
+compatibility_date = "2026-08-31"
+
+# Add Cron Triggers only after configuring a private runtime target.
+# Never put GITHUB_TOKEN or any other secret in this file.

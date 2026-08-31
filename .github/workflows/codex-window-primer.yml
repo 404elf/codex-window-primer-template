@@ -6,6 +6,15 @@ on:
     - cron: "0 0 1 1 *"
       timezone: "Asia/Shanghai"
   workflow_dispatch:
+    inputs:
+      source:
+        description: Invocation source
+        required: true
+        default: manual
+        type: choice
+        options:
+          - manual
+          - cloudflare
 
 permissions:
   contents: read
@@ -37,6 +46,7 @@ jobs:
         id: gate
         env:
           EVENT_NAME: ${{ github.event_name }}
+          DISPATCH_SOURCE: ${{ inputs.source }}
           WAKEUP_SCHEDULE: ${{ github.event.schedule }}
         run: |
           set -euo pipefail
@@ -44,7 +54,8 @@ jobs:
           import json
           import os
           from datetime import datetime
-          from schedule_logic import due_window, validate_plan
+          from schedule_logic import validate_plan
+          from workflow_gate import decide_workflow_gate
 
           with open(os.environ["PLAN_FILE"], "r", encoding="utf-8") as handle:
               plan = json.load(handle)
@@ -61,16 +72,16 @@ jobs:
               raise SystemExit("Invalid schedule configuration")
 
           now = datetime.now(timing.zone)
-          if os.environ["EVENT_NAME"] == "workflow_dispatch":
-              due = True
-              primer = timing.primer
-              print("Manual run requested; bypassing only the calendar gate.")
-          else:
-              due, primer = due_window(
-                  plan,
-                  now,
-                  wakeup_schedule=os.environ.get("WAKEUP_SCHEDULE") or None,
-              )
+          decision = decide_workflow_gate(
+              plan,
+              now,
+              event_name=os.environ["EVENT_NAME"],
+              dispatch_source=os.environ.get("DISPATCH_SOURCE", ""),
+              wakeup_schedule=os.environ.get("WAKEUP_SCHEDULE") or None,
+          )
+          due = decision.due
+          primer = decision.primer
+          print(f"Gate decision: {decision.reason}.")
 
           print(f"Configured timezone: {plan['timezone']}; current local time: {now.isoformat()}")
           primer_text = primer.isoformat() if primer is not None else "none"
